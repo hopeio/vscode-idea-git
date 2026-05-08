@@ -7,6 +7,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
   private static readonly PAGE_SIZE = 200;
   private view?: vscode.WebviewView;
   private currentRepo?: GitRepo;
+  private currentLogFilters: { branch?: string; author?: string; after?: string; before?: string; path?: string } = {};
 
   constructor(private extensionUri: vscode.Uri, private gitService: GitService) {}
 
@@ -32,6 +33,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       case 'ready': await this.refresh(); break;
       case 'loadLog': {
         const filters = msg.filters || {};
+        this.currentLogFilters = filters;
         const skip = Number(msg.skip || 0);
         const defaultCount = skip > 0 ? LogViewProvider.PAGE_SIZE : LogViewProvider.INITIAL_PAGE_SIZE;
         const maxCount = Number(msg.maxCount || defaultCount);
@@ -39,8 +41,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         const branches = await this.gitService.getBranches(repo);
         const currentBranch = await this.gitService.getCurrentBranch(repo);
         const tags = await this.gitService.getTags(repo);
-        const userEmail = await this.gitService.getUserEmail(repo);
-        this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, userEmail, append: !!msg.append, hasMore: commits.length >= maxCount });
+        this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, append: !!msg.append, hasMore: commits.length >= maxCount });
         break;
       }
       case 'selectCommit': {
@@ -93,6 +94,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
           } else {
             vscode.window.showInformationMessage(`已切换到分支: ${cur}`);
           }
+          this.postMessage({ type: 'branchSwitched', branch: cur });
         } catch (e: any) {
           if (!e.message?.includes('用户取消')) { vscode.window.showErrorMessage(`切换分支失败: ${e.message}`); }
         }
@@ -104,6 +106,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         const target = repos.find(r => r.rootPath === msg.repoPath);
         if (target) {
           this.currentRepo = target;
+          this.currentLogFilters = {};
           vscode.commands.executeCommand('ideaGit.repoChanged', target);
           await this.refresh();
         }
@@ -355,13 +358,13 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       }
       case 'fixup': {
         const terminal = vscode.window.createTerminal({ name: 'Git Fixup', cwd: repo });
-        terminal.sendText(`GIT_SEQUENCE_EDITOR="sed -i '' 's/^pick/fixup/'" git rebase -i ${msg.hash}~1`);
+        terminal.sendText(`if git rev-parse --verify ${msg.hash}~2 >/dev/null 2>&1; then GIT_SEQUENCE_EDITOR="sed -i '' 's/^pick ${msg.hash} /fixup ${msg.hash} /'" git rebase -i ${msg.hash}~2; else GIT_SEQUENCE_EDITOR="sed -i '' 's/^pick ${msg.hash} /fixup ${msg.hash} /'" git rebase -i --root; fi`);
         terminal.show();
         break;
       }
       case 'squashInto': {
         const terminal = vscode.window.createTerminal({ name: 'Git Squash Into', cwd: repo });
-        terminal.sendText(`GIT_SEQUENCE_EDITOR="sed -i '' '2s/^pick/squash/'" git rebase -i ${msg.hash}~2`);
+        terminal.sendText(`if git rev-parse --verify ${msg.hash}~2 >/dev/null 2>&1; then GIT_SEQUENCE_EDITOR="sed -i '' 's/^pick ${msg.hash} /squash ${msg.hash} /'" git rebase -i ${msg.hash}~2; else GIT_SEQUENCE_EDITOR="sed -i '' 's/^pick ${msg.hash} /squash ${msg.hash} /'" git rebase -i --root; fi`);
         terminal.show();
         break;
       }
@@ -430,12 +433,12 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
     if (!this.view || !this.currentRepo) { return; }
     try {
       const repo = this.currentRepo.rootPath;
-      const [commits, branches, currentBranch, tags, userEmail] = await Promise.all([
-        this.gitService.getLog(repo, { maxCount: LogViewProvider.INITIAL_PAGE_SIZE }), this.gitService.getBranches(repo),
-        this.gitService.getCurrentBranch(repo), this.gitService.getTags(repo), this.gitService.getUserEmail(repo)
+      const [commits, branches, currentBranch, tags] = await Promise.all([
+        this.gitService.getLog(repo, { ...this.currentLogFilters, maxCount: LogViewProvider.INITIAL_PAGE_SIZE }), this.gitService.getBranches(repo),
+        this.gitService.getCurrentBranch(repo), this.gitService.getTags(repo)
       ]);
       const repos = this.gitService.getRepos();
-      this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, userEmail, repos, currentRepoPath: repo, append: false, hasMore: commits.length >= LogViewProvider.INITIAL_PAGE_SIZE });
+      this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, repos, currentRepoPath: repo, append: false, hasMore: commits.length >= LogViewProvider.INITIAL_PAGE_SIZE });
     } catch (e: any) { vscode.window.showErrorMessage(`刷新失败: ${e.message}`); }
   }
 
@@ -607,7 +610,7 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size,13px
 <div class="ctx-menu hidden" id="ctxSubMenu"></div>
 <script>
 const vscode=acquireVsCodeApi();
-let allCommits=[],allBranches=[],allTags=[],currentBranch='',userEmail='';
+let allCommits=[],allBranches=[],allTags=[],currentBranch='';
 let selectedHashes=new Set(),lastClickedIdx=-1;
 let branchViewMode='tree', filesViewMode='tree';
 let currentFilesHash=null, currentFiles=[], currentDetail=null, currentMergeGroups=null;
@@ -626,7 +629,7 @@ window.addEventListener('message',e=>{
     }else{
       allCommits=incoming;
     }
-    allBranches=m.branches||allBranches;allTags=m.tags||allTags;currentBranch=m.currentBranch||currentBranch;userEmail=m.userEmail||userEmail;
+    allBranches=m.branches||allBranches;allTags=m.tags||allTags;currentBranch=m.currentBranch||currentBranch;
     logHasMore=typeof m.hasMore==='boolean'?m.hasMore:(incoming.length>=LOG_PAGE_SIZE);
     logLoadingMore=false;
     if(m.repos)renderRepoSelect(m.repos,m.currentRepoPath);
@@ -635,6 +638,13 @@ window.addEventListener('message',e=>{
     currentFilesHash=m.hash;currentFiles=m.files||[];currentDetail=m.detail||null;currentMergeGroups=m.mergeGroups||null;renderFiles(currentFiles,m.hash);
   }else if(m.type==='compareFiles'){
     renderCompareFiles(m.from,m.to,m.files||[],m.fromLabel||m.from,m.toLabel||m.to,m.diffMode||'');
+  }else if(m.type==='branchSwitched'){
+    if(m.branch&&typeof m.branch==='string'){
+      filters.branch=m.branch;
+      renderFilterBar();
+      highlightBranch(m.branch);
+      applyF();
+    }
   }
 });
 
@@ -842,9 +852,10 @@ function renderLog(cs){
       if(r.startsWith('tag:'))return '<span class="ref-tag ref-tag-label">'+eh(r)+'</span>';
       return '<span class="ref-tag ref-branch">'+eh(r)+'</span>';}).join('');
     const isMerge=c.parents&&c.parents.length>1?' merge':'';
+    const starred=isAuthorDifferentFromCommitter(c);
     h+='<div class="log-row'+sel+isMerge+'" data-hash="'+c.hash+'" data-idx="'+i+'" data-msg="'+esc(c.message)+'">'
       +'<div class="col-graph">'+gSvg(gn[i])+'</div><div class="col-msg"><span class="msg-text">'+eh(c.message)+'</span>'+(refs?'<span class="msg-refs" title="'+esc(c.refs.join('\\n'))+'">'+refs+'</span>':'')+'</div>'
-      +'<div class="col-author">'+(c.email===userEmail?'<b>'+eh(c.author)+'*</b>':eh(c.author))+'</div><div class="col-date">'+fD(c.date)+'</div>'
+      +'<div class="col-author">'+(starred?'<b>'+eh(c.author)+'*</b>':eh(c.author))+'</div><div class="col-date">'+fD(c.date)+'</div>'
       +'<div class="col-hash">'+c.abbrevHash+'</div></div>';
   }
   sc.innerHTML=h;
@@ -894,7 +905,6 @@ function ctxCommit(e,row){
   const childHash=idx>0?filteredCommits[idx-1].hash:null;
   showCtx(e.clientX,e.clientY,[
     {icon:'\\u{1F4CB}',label:'Copy Revision Number',action:()=>{navigator.clipboard.writeText(hash);}},
-    {icon:'\\u{1F4E4}',label:'Create Patch...',action:()=>vscode.postMessage({type:'createPatch',hash})},
     {icon:'\\u{1F352}',label:'Cherry-Pick',action:()=>vscode.postMessage({type:'cherryPick',hash})},
     {sep:1},
     {icon:'\\u21AA',label:'Checkout Revision',action:()=>vscode.postMessage({type:'checkoutRevision',hash})},
@@ -907,8 +917,6 @@ function ctxCommit(e,row){
     {icon:'\\u{1F527}',label:'Fixup...',action:()=>vscode.postMessage({type:'fixup',hash})},
     {icon:'\\u{1F4E5}',label:'Squash Into...',action:()=>vscode.postMessage({type:'squashInto',hash})},
     {icon:'\\u2716',label:'Drop Commit',action:()=>vscode.postMessage({type:'dropCommit',hash})},
-    {icon:'\\u{1F4E6}',label:'Squash Commits...',action:doSq},
-    {icon:'\\u{1F501}',label:'Interactively Rebase from Here...',action:()=>vscode.postMessage({type:'interactiveRebase',hash})},
     {icon:'\\u{1F680}',label:'Push All up to Here...',action:()=>vscode.postMessage({type:'pushUpTo',hash})},
     {sep:1},
     {icon:'\\u{1F33F}',label:'New Branch...',action:()=>vscode.postMessage({type:'newBranchFromCommit',hash})},
@@ -1333,6 +1341,11 @@ function eh(s){return s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/
 function esc(s){return s?s.replace(/"/g,'&quot;').replace(/'/g,'&#39;'):'';}
 function fD(iso){try{const d=new Date(iso);return d.getFullYear()+'/'+(d.getMonth()+1).toString().padStart(2,'0')+'/'+d.getDate().toString().padStart(2,'0')+' '+d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');}catch(e){return iso;}}
 function fileStatusIcon(st){if(st==='A')return '\\u{1F195}';if(st==='M')return '\\u270F\\uFE0F';if(st==='D')return '\\u{1F5D1}\\uFE0F';if(st==='R')return '\\u{1F501}';if(st==='C')return '\\u{1F4CB}';return '\\u{1F4C4}';}
+function norm(s){return (s||'').trim().toLowerCase();}
+function isAuthorDifferentFromCommitter(c){
+  const an=norm(c.author),cn=norm(c.committer),ae=norm(c.email),ce=norm(c.committerEmail);
+  return an!==cn||ae!==ce;
+}
 
 applyColWidths();
 vscode.postMessage({type:'ready'});

@@ -25,6 +25,8 @@ export interface GitCommit {
   abbrevHash: string;
   author: string;
   email: string;
+  committer: string;
+  committerEmail: string;
   date: string;
   timestamp: number;
   message: string;
@@ -142,8 +144,15 @@ export class GitService {
     } catch { return []; }
   }
 
-  async getUserEmail(repoPath: string): Promise<string> {
-    try { return (await this.git(repoPath, ['config', 'user.email'])).trim(); } catch { return ''; }
+  async getUserEmails(repoPath: string): Promise<string[]> {
+    try {
+      const out = await this.git(repoPath, ['config', '--get-all', 'user.email']);
+      return out.trim().split('\n').map(s => s.trim()).filter(Boolean);
+    } catch { return []; }
+  }
+
+  async getUserName(repoPath: string): Promise<string> {
+    try { return (await this.git(repoPath, ['config', 'user.name'])).trim(); } catch { return ''; }
   }
 
   async getCurrentBranch(repoPath: string): Promise<string> {
@@ -238,7 +247,7 @@ export class GitService {
   async getLog(repoPath: string, opts: { maxCount?: number; skip?: number; branch?: string; author?: string; after?: string; before?: string; path?: string } = {}): Promise<GitCommit[]> {
     const SEP = '\x1e';
     const REC = '\x1f';
-    const format = ['%H', '%h', '%an', '%ae', '%aI', '%at', '%s', '%P', '%D'].join(SEP);
+    const format = ['%H', '%h', '%an', '%aE', '%cn', '%cE', '%aI', '%at', '%s', '%P', '%D'].join(SEP);
     const args = ['log', `--format=${format}`, '--decorate=short'];
     args.push(`--max-count=${opts.maxCount || 500}`);
     if (opts.skip && opts.skip > 0) { args.push(`--skip=${opts.skip}`); }
@@ -254,12 +263,12 @@ export class GitService {
     for (const line of out.trim().split('\n')) {
       if (!line) { continue; }
       const parts = line.split(SEP);
-      if (parts.length < 9) { continue; }
-      const refs = parts[8] ? parts[8].split(',').map(r => r.trim()).filter(Boolean) : [];
+      if (parts.length < 11) { continue; }
+      const refs = parts[10] ? parts[10].split(',').map(r => r.trim()).filter(Boolean) : [];
       commits.push({
-        hash: parts[0], abbrevHash: parts[1], author: parts[2], email: parts[3],
-        date: parts[4], timestamp: parseInt(parts[5], 10), message: parts[6],
-        parents: parts[7] ? parts[7].split(' ').filter(Boolean) : [], refs
+        hash: parts[0], abbrevHash: parts[1], author: parts[2], email: parts[3], committer: parts[4], committerEmail: parts[5],
+        date: parts[6], timestamp: parseInt(parts[7], 10), message: parts[8],
+        parents: parts[9] ? parts[9].split(' ').filter(Boolean) : [], refs
       });
     }
     return commits;
@@ -384,15 +393,32 @@ export class GitService {
   async smartUpdateBranch(repoPath: string, branch: string): Promise<{ updated: boolean; shelved: boolean; branch: string; stashRef?: string; unshelveConflicts: string[] }> {
     let target = branch;
     if (target.startsWith('origin/')) { target = target.slice('origin/'.length); }
-    const before = (await this.git(repoPath, ['rev-parse', target])).trim();
+    const before = await this.revParseMaybe(repoPath, target);
     const current = await this.getCurrentBranch(repoPath);
+    if (current !== target) {
+      if (branch.startsWith('origin/')) {
+        const remoteBefore = await this.revParseMaybe(repoPath, branch);
+        await this.fetchAll(repoPath);
+        const remoteAfter = await this.revParseMaybe(repoPath, branch);
+        return { updated: !!remoteBefore && !!remoteAfter && remoteBefore !== remoteAfter, shelved: false, branch: target, unshelveConflicts: [] };
+      }
+      await this.fetchAll(repoPath);
+      const tracking = await this.getTrackingBranch(repoPath, target);
+      if (!tracking) { return { updated: false, shelved: false, branch: target, unshelveConflicts: [] }; }
+      const localHash = await this.revParseMaybe(repoPath, target);
+      const remoteHash = await this.revParseMaybe(repoPath, tracking);
+      if (!localHash || !remoteHash || localHash === remoteHash) {
+        return { updated: false, shelved: false, branch: target, unshelveConflicts: [] };
+      }
+      const canFastForward = await this.isAncestor(repoPath, localHash, remoteHash);
+      if (!canFastForward) {
+        return { updated: false, shelved: false, branch: target, unshelveConflicts: [] };
+      }
+      await this.git(repoPath, ['branch', '-f', target, tracking]);
+      return { updated: true, shelved: false, branch: target, unshelveConflicts: [] };
+    }
     let shelved = false;
     let stashRef: string | undefined;
-    if (current !== target) {
-      const switched = await this.smartCheckout(repoPath, target);
-      shelved = switched.shelved;
-      stashRef = switched.stashRef;
-    }
     try {
       await this.pullBranch(repoPath);
     } catch {
@@ -410,8 +436,8 @@ export class GitService {
       const un = await this.unshelve(repoPath);
       if (!un.ok) { unshelveConflicts = un.conflictFiles; }
     }
-    const after = (await this.git(repoPath, ['rev-parse', target])).trim();
-    return { updated: before !== after, shelved, branch: target, stashRef, unshelveConflicts };
+    const after = await this.revParseMaybe(repoPath, target);
+    return { updated: !!before && !!after && before !== after, shelved, branch: target, stashRef, unshelveConflicts };
   }
 
   async getConflictFiles(repoPath: string): Promise<string[]> {
@@ -432,6 +458,17 @@ export class GitService {
 
   async fetchAll(repoPath: string): Promise<void> {
     await this.git(repoPath, ['fetch', '--all', '--prune']);
+  }
+
+  private async revParseMaybe(repoPath: string, ref: string): Promise<string | undefined> {
+    try { return (await this.git(repoPath, ['rev-parse', ref])).trim(); } catch { return undefined; }
+  }
+
+  private async isAncestor(repoPath: string, base: string, tip: string): Promise<boolean> {
+    try {
+      await this.git(repoPath, ['merge-base', '--is-ancestor', base, tip]);
+      return true;
+    } catch { return false; }
   }
 
   async pushBranch(repoPath: string, branch: string, setUpstream: boolean = false): Promise<void> {
