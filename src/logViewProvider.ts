@@ -102,7 +102,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         break;
       }
       case 'fileHistory':
-        await this.openFileHistoryPanel(repo, msg.filePath, msg.hash);
+        await this.openFileHistoryTabWithNativeDiff(repo, msg.filePath, msg.hash);
         break;
       case 'unsupportedFileAction':
         vscode.window.showInformationMessage('该操作在当前版本按“文件级”暂不支持“选中部分变更”');
@@ -466,6 +466,88 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
   }
 
   postMessage(msg: any) { this.view?.webview.postMessage(msg); }
+
+  async openFileHistoryTabWithNativeDiff(repo: string, filePath: string, uptoHash: string = 'HEAD') {
+    const commits = await this.gitService.getFileHistory(repo, filePath, uptoHash);
+    if (!commits.length) {
+      vscode.window.showInformationMessage('该文件暂无提交历史');
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      'ideaGit.fileHistory.nativeDiff',
+      `File History: ${path.basename(filePath)}`,
+      vscode.ViewColumn.Active,
+      { enableScripts: true, retainContextWhenHidden: true }
+    );
+    const firstHash = commits[0].hash;
+    const firstPatch = await this.gitService.getFilePatchAtCommit(repo, firstHash, filePath);
+    const items = JSON.stringify(commits.map(c => ({
+      hash: c.hash, abbrevHash: c.abbrevHash, author: c.author, date: c.date, message: c.message
+    })));
+    panel.webview.html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
+      body{margin:0;padding:0;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);font-family:var(--vscode-font-family);font-size:12px}
+      .wrap{display:flex;height:100vh}.left{width:320px;border-right:1px solid var(--vscode-panel-border);overflow:auto}
+      .right{flex:1;overflow:auto;padding:0}
+      .item{padding:6px 10px;border-bottom:1px solid var(--vscode-panel-border);cursor:pointer}
+      .item:hover{background:var(--vscode-list-hoverBackground)}.item.sel{background:var(--vscode-list-activeSelectionBackground);color:var(--vscode-list-activeSelectionForeground)}
+      .m1{display:flex;align-items:center;gap:8px}
+      .m1t{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+      .native{opacity:.75;cursor:pointer;user-select:none}
+      .native:hover{opacity:1}
+      .m2{color:var(--vscode-descriptionForeground);margin-top:2px}
+      .ph{position:sticky;top:0;background:var(--vscode-editor-background);border-bottom:1px solid var(--vscode-panel-border);padding:6px 10px;display:flex;gap:8px;align-items:center}
+      .hint{margin-left:auto;color:var(--vscode-descriptionForeground);font-size:11px}
+      .b{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px}.b.add{background:#2ea04333;color:#3fb950}.b.del{background:#f8514933;color:#ff7b72}
+      #patch{padding:8px 10px;font-family:var(--vscode-editor-font-family,monospace);line-height:1.45;white-space:pre;overflow:auto}
+      .l{display:block}.l.h{color:#6ea8fe}.l.a{color:#3fb950;background:#2ea0431f}.l.d{color:#ff7b72;background:#f851491f}.l.m{color:#d2a8ff}
+      .l.c{color:#8b949e}.ctx{display:block;color:#79c0ff;cursor:pointer;background:#1f6feb22;padding:1px 6px;margin:1px 0;border-radius:4px}
+      .ctx:hover{background:#1f6feb44}
+    </style></head><body><div class="wrap"><div class="left" id="left"></div><div class="right"><div class="ph"><span class="b add" id="addCnt">+0</span><span class="b del" id="delCnt">-0</span><span class="hint">点击左侧小图标打开原生 Diff</span></div><div id="patch"></div></div></div>
+      <script>
+        const vscode=acquireVsCodeApi();const commits=${items};const left=document.getElementById('left');
+        function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+        function render(sel){
+          left.innerHTML=commits.map(c=>'<div class="item'+(c.hash===sel?' sel':'')+'" data-h="'+c.hash+'"><div class="m1"><span class="m1t">'+esc(c.message||'')+'</span><span class="native" data-nh="'+c.hash+'" title="打开 VS Code 原生 Diff">⧉</span></div><div class="m2">'+esc(c.abbrevHash)+'  '+esc(c.author||'')+'  '+esc((c.date||'').replace('T',' ').slice(0,16))+'</div></div>').join('');
+          left.querySelectorAll('.item').forEach(el=>el.onclick=()=>{const h=el.getAttribute('data-h');render(h);vscode.postMessage({type:'selectHistoryCommitPatch',hash:h});});
+          left.querySelectorAll('.native').forEach(el=>el.onclick=e=>{e.stopPropagation();const h=el.getAttribute('data-nh');vscode.postMessage({type:'openHistoryCommitNativeDiff',hash:h});});
+        }
+        const ctxOpen=new Set();
+        function renderPatch(p){const lines=(p||'').split('\\n');let add=0,del=0,html='';let i=0,b=0;
+          while(i<lines.length){const ln=lines[i];
+            if(ln.startsWith(' ')){let j=i;while(j<lines.length&&lines[j].startsWith(' '))j++;const block=lines.slice(i,j);
+              const headKeep=2,tailKeep=2,minFold=7;
+              const folded=block.length>=minFold&&!ctxOpen.has(b);
+              if(folded){
+                for(const l of block.slice(0,headKeep)){html+='<span class="l c">'+esc(l)+'</span>';}
+                html+='<span class="ctx" data-b="'+b+'">↕ Show '+(block.length-headKeep-tailKeep)+' more context lines</span>';
+                for(const l of block.slice(-tailKeep)){html+='<span class="l c">'+esc(l)+'</span>';}
+              }else{
+                for(const l of block){html+='<span class="l c">'+esc(l)+'</span>';}
+              }
+              b++;i=j;continue;
+            }
+            let cls='';if(ln.startsWith('+++')||ln.startsWith('---')){cls='h';}
+            else if(ln.startsWith('@@')){cls='m';}else if(ln.startsWith('+')){cls='a';add++;}else if(ln.startsWith('-')){cls='d';del++;}
+            html+='<span class="l '+cls+'">'+esc(ln)+'</span>';i++;
+          }
+          const pEl=document.getElementById('patch');pEl.innerHTML=html;document.getElementById('addCnt').textContent='+'+add;document.getElementById('delCnt').textContent='-'+del;
+          pEl.querySelectorAll('.ctx').forEach(el=>{el.onclick=()=>{ctxOpen.add(Number(el.dataset.b));renderPatch(p);};});
+        }
+        render('${firstHash}');
+        renderPatch(${JSON.stringify(firstPatch)});
+        window.addEventListener('message',e=>{const m=e.data;if(m.type==='historyPatch'){renderPatch(m.patch||'');render(m.hash||'');}});
+      </script></body></html>`;
+    panel.webview.onDidReceiveMessage(async (msg) => {
+      if (!msg.hash) { return; }
+      if (msg.type === 'openHistoryCommitNativeDiff') {
+        await this.gitService.showFileDiffInNewTab(repo, msg.hash, filePath);
+        return;
+      }
+      if (msg.type !== 'selectHistoryCommitPatch') { return; }
+      const patch = await this.gitService.getFilePatchAtCommit(repo, msg.hash, filePath);
+      panel.webview.postMessage({ type: 'historyPatch', hash: msg.hash, patch });
+    });
+  }
 
   private async openFileHistoryPanel(repo: string, filePath: string, uptoHash: string) {
     const commits = await this.gitService.getFileHistory(repo, filePath, uptoHash);

@@ -3,6 +3,7 @@ import { GitService } from './gitService';
 import { StatusBarManager } from './statusBar';
 import { LogViewProvider } from './logViewProvider';
 import { GitDiffContentProvider } from './diffProvider';
+import * as path from 'path';
 
 export async function activate(context: vscode.ExtensionContext) {
   const gitService = new GitService();
@@ -44,6 +45,18 @@ export async function activate(context: vscode.ExtensionContext) {
       isFetching = false;
     }
   }
+
+  const toGitPath = (p: string) => p.split(path.sep).join('/');
+  const getRepoForFile = async (filePath: string) => {
+    let repos = gitService.getRepos();
+    if (!repos.length) {
+      const folders = vscode.workspace.workspaceFolders;
+      if (folders) { repos = await gitService.discoverRepos(folders); }
+    }
+    return repos
+      .filter(r => filePath === r.rootPath || filePath.startsWith(r.rootPath + path.sep))
+      .sort((a, b) => b.rootPath.length - a.rootPath.length)[0];
+  };
 
   context.subscriptions.push(
     vscode.commands.registerCommand('ideaGit.switchBranch', () => statusBar.switchBranch()),
@@ -105,6 +118,17 @@ export async function activate(context: vscode.ExtensionContext) {
       logProvider.setRepo(pick.repo);
       await statusBar.refresh();
       logProvider.refresh();
+    }),
+    vscode.commands.registerCommand('ideaGit.fileHistory', async (uri?: vscode.Uri) => {
+      const target = uri ?? vscode.window.activeTextEditor?.document.uri;
+      if (!target || target.scheme !== 'file') { return; }
+      const repo = await getRepoForFile(target.fsPath);
+      if (!repo) {
+        vscode.window.showWarningMessage('当前文件不在已识别的 Git 仓库内');
+        return;
+      }
+      const relPath = toGitPath(path.relative(repo.rootPath, target.fsPath));
+      await logProvider.openFileHistoryTabWithNativeDiff(repo.rootPath, relPath, 'HEAD');
     }),
     vscode.commands.registerCommand('ideaGit.repoChanged', (repo) => {
       statusBar.setRepo(repo);

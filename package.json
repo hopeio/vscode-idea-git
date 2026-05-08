@@ -81,6 +81,10 @@
       {
         "command": "ideaGit.selectRepo",
         "title": "IDEA Git: Select Repository"
+      },
+      {
+        "command": "ideaGit.fileHistory",
+        "title": "IDEA Git: File History"
       }
     ],
     "viewsContainers": {
@@ -102,6 +106,13 @@
       ]
     },
     "menus": {
+      "explorer/context": [
+        {
+          "command": "ideaGit.fileHistory",
+          "when": "resourceScheme == file",
+          "group": "navigation"
+        }
+      ],
       "view/title": [
         {
           "command": "ideaGit.refresh",
