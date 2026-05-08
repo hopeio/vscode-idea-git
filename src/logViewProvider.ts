@@ -8,6 +8,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private currentRepo?: GitRepo;
   private currentLogFilters: { branch?: string; author?: string; after?: string; before?: string; path?: string } = {};
+  private defaultBranchFilterAppliedRepo?: string;
 
   constructor(private extensionUri: vscode.Uri, private gitService: GitService) {}
 
@@ -107,6 +108,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         if (target) {
           this.currentRepo = target;
           this.currentLogFilters = {};
+          this.defaultBranchFilterAppliedRepo = undefined;
           vscode.commands.executeCommand('ideaGit.repoChanged', target);
           await this.refresh();
         }
@@ -433,12 +435,17 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
     if (!this.view || !this.currentRepo) { return; }
     try {
       const repo = this.currentRepo.rootPath;
-      const [commits, branches, currentBranch, tags] = await Promise.all([
-        this.gitService.getLog(repo, { ...this.currentLogFilters, maxCount: LogViewProvider.INITIAL_PAGE_SIZE }), this.gitService.getBranches(repo),
-        this.gitService.getCurrentBranch(repo), this.gitService.getTags(repo)
+      const [branches, currentBranch, tags] = await Promise.all([
+        this.gitService.getBranches(repo), this.gitService.getCurrentBranch(repo), this.gitService.getTags(repo)
       ]);
+      const noFilters = !this.currentLogFilters.branch && !this.currentLogFilters.author && !this.currentLogFilters.after && !this.currentLogFilters.before && !this.currentLogFilters.path;
+      if (noFilters && this.defaultBranchFilterAppliedRepo !== repo && currentBranch && !currentBranch.startsWith('(')) {
+        this.currentLogFilters = { branch: currentBranch };
+        this.defaultBranchFilterAppliedRepo = repo;
+      }
+      const commits = await this.gitService.getLog(repo, { ...this.currentLogFilters, maxCount: LogViewProvider.INITIAL_PAGE_SIZE });
       const repos = this.gitService.getRepos();
-      this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, repos, currentRepoPath: repo, append: false, hasMore: commits.length >= LogViewProvider.INITIAL_PAGE_SIZE });
+      this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, repos, currentRepoPath: repo, activeFilters: this.currentLogFilters, append: false, hasMore: commits.length >= LogViewProvider.INITIAL_PAGE_SIZE });
     } catch (e: any) { vscode.window.showErrorMessage(`刷新失败: ${e.message}`); }
   }
 
@@ -622,6 +629,14 @@ const $=id=>document.getElementById(id);
 window.addEventListener('message',e=>{
   const m=e.data;
   if(m.type==='logData'){
+    if(m.activeFilters){
+      filters.branch=m.activeFilters.branch||'';
+      filters.author=m.activeFilters.author||'';
+      filters.after=m.activeFilters.after||'';
+      filters.before=m.activeFilters.before||'';
+      filters.path=m.activeFilters.path||'';
+      $('pathInput').value=filters.path||'';
+    }
     const incoming=m.commits||[];
     if(m.append){
       const seen=new Set(allCommits.map(c=>c.hash));
@@ -907,7 +922,6 @@ function ctxCommit(e,row){
     {icon:'\\u{1F4CB}',label:'Copy Revision Number',action:()=>{navigator.clipboard.writeText(hash);}},
     {icon:'\\u{1F352}',label:'Cherry-Pick',action:()=>vscode.postMessage({type:'cherryPick',hash})},
     {sep:1},
-    {icon:'\\u21AA',label:'Checkout Revision',action:()=>vscode.postMessage({type:'checkoutRevision',hash})},
     {icon:'\\u{1F50D}',label:'Compare with Local',action:()=>vscode.postMessage({type:'compareWithLocal',hash})},
     {sep:1},
     {icon:'\\u21A9',label:'Reset Current Branch to Here...',action:()=>vscode.postMessage({type:'resetTo',hash})},
