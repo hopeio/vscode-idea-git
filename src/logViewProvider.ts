@@ -3,6 +3,8 @@ import { GitService, GitRepo, GitCommit, GitBranch, GitFileChange } from './gitS
 
 export class LogViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'ideaGit.logView';
+  private static readonly INITIAL_PAGE_SIZE = 80;
+  private static readonly PAGE_SIZE = 200;
   private view?: vscode.WebviewView;
   private currentRepo?: GitRepo;
 
@@ -29,12 +31,16 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
     switch (msg.type) {
       case 'ready': await this.refresh(); break;
       case 'loadLog': {
-        const commits = await this.gitService.getLog(repo, msg.filters || {});
+        const filters = msg.filters || {};
+        const skip = Number(msg.skip || 0);
+        const defaultCount = skip > 0 ? LogViewProvider.PAGE_SIZE : LogViewProvider.INITIAL_PAGE_SIZE;
+        const maxCount = Number(msg.maxCount || defaultCount);
+        const commits = await this.gitService.getLog(repo, { ...filters, skip, maxCount });
         const branches = await this.gitService.getBranches(repo);
         const currentBranch = await this.gitService.getCurrentBranch(repo);
         const tags = await this.gitService.getTags(repo);
         const userEmail = await this.gitService.getUserEmail(repo);
-        this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, userEmail });
+        this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, userEmail, append: !!msg.append, hasMore: commits.length >= maxCount });
         break;
       }
       case 'selectCommit': {
@@ -299,8 +305,9 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       }
       case 'pushBranch': {
         try {
-          await this.gitService.pushBranch(repo, msg.branch, msg.setUpstream);
-          vscode.window.showInformationMessage(`已 Push ${msg.branch}`);
+          const res = await this.gitService.smartPushBranch(repo, msg.branch, msg.setUpstream);
+          vscode.window.showInformationMessage(`已 Push ${msg.branch}${res.rebased ? '（已自动 Rebase）' : ''}`);
+          await this.refresh();
         } catch (e: any) { vscode.window.showErrorMessage(`Push 失败: ${e.message}`); }
         break;
       }
@@ -433,11 +440,11 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
     try {
       const repo = this.currentRepo.rootPath;
       const [commits, branches, currentBranch, tags, userEmail] = await Promise.all([
-        this.gitService.getLog(repo), this.gitService.getBranches(repo),
+        this.gitService.getLog(repo, { maxCount: LogViewProvider.INITIAL_PAGE_SIZE }), this.gitService.getBranches(repo),
         this.gitService.getCurrentBranch(repo), this.gitService.getTags(repo), this.gitService.getUserEmail(repo)
       ]);
       const repos = this.gitService.getRepos();
-      this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, userEmail, repos, currentRepoPath: repo });
+      this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, userEmail, repos, currentRepoPath: repo, append: false, hasMore: commits.length >= LogViewProvider.INITIAL_PAGE_SIZE });
     } catch (e: any) { vscode.window.showErrorMessage(`刷新失败: ${e.message}`); }
   }
 
@@ -613,12 +620,24 @@ let allCommits=[],allBranches=[],allTags=[],currentBranch='',userEmail='';
 let selectedHashes=new Set(),lastClickedIdx=-1;
 let branchViewMode='tree', filesViewMode='tree';
 let currentFilesHash=null, currentFiles=[], currentDetail=null, currentMergeGroups=null;
+const LOG_INITIAL_PAGE_SIZE=80;
+const LOG_PAGE_SIZE=200;
+let logHasMore=true,logLoadingMore=false,currentLoadFilters={};
 const $=id=>document.getElementById(id);
 
 window.addEventListener('message',e=>{
   const m=e.data;
   if(m.type==='logData'){
-    allCommits=m.commits||[];allBranches=m.branches||[];allTags=m.tags||[];currentBranch=m.currentBranch||'';userEmail=m.userEmail||'';
+    const incoming=m.commits||[];
+    if(m.append){
+      const seen=new Set(allCommits.map(c=>c.hash));
+      for(const c of incoming){if(!seen.has(c.hash))allCommits.push(c);}
+    }else{
+      allCommits=incoming;
+    }
+    allBranches=m.branches||allBranches;allTags=m.tags||allTags;currentBranch=m.currentBranch||currentBranch;userEmail=m.userEmail||userEmail;
+    logHasMore=typeof m.hasMore==='boolean'?m.hasMore:(incoming.length>=LOG_PAGE_SIZE);
+    logLoadingMore=false;
     if(m.repos)renderRepoSelect(m.repos,m.currentRepoPath);
     renderBranches();renderBranchFilter();renderAuthorList();renderFilterBar();renderLog(allCommits);
   }else if(m.type==='commitFiles'){
@@ -1120,7 +1139,10 @@ function applyF(){
   if(filters.after)f.after=filters.after;
   if(filters.before)f.before=filters.before;
   if(filters.path)f.path=filters.path;
-  vscode.postMessage({type:'loadLog',filters:f});
+  currentLoadFilters=f;
+  logHasMore=true;
+  logLoadingMore=true;
+  vscode.postMessage({type:'loadLog',filters:f,skip:0,maxCount:LOG_INITIAL_PAGE_SIZE,append:false});
   renderFilterBar();
 }
 
@@ -1230,6 +1252,13 @@ function filterBranchPanel(q){
 /* ===== Text search ===== */
 let searchTimer=null;
 $('searchInput').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>renderLog(allCommits),200);};
+$('logScroll').addEventListener('scroll',()=>{
+  const sc=$('logScroll');
+  if(logLoadingMore||!logHasMore)return;
+  if(sc.scrollTop+sc.clientHeight<sc.scrollHeight-120)return;
+  logLoadingMore=true;
+  vscode.postMessage({type:'loadLog',filters:currentLoadFilters,skip:allCommits.length,maxCount:LOG_PAGE_SIZE,append:true});
+});
 
 /* ===== Resize ===== */
 function setupR(hid,dir){$(hid).onmousedown=e=>{e.preventDefault();const pn=dir==='left'?$('branchPanel'):$('filesPanel'),sX=e.clientX,sW=pn.offsetWidth;

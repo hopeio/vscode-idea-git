@@ -235,12 +235,13 @@ export class GitService {
     return this.stashPop(repoPath);
   }
 
-  async getLog(repoPath: string, opts: { maxCount?: number; branch?: string; author?: string; after?: string; before?: string; path?: string } = {}): Promise<GitCommit[]> {
+  async getLog(repoPath: string, opts: { maxCount?: number; skip?: number; branch?: string; author?: string; after?: string; before?: string; path?: string } = {}): Promise<GitCommit[]> {
     const SEP = '\x1e';
     const REC = '\x1f';
     const format = ['%H', '%h', '%an', '%ae', '%aI', '%at', '%s', '%P', '%D'].join(SEP);
     const args = ['log', `--format=${format}`, '--decorate=short'];
     args.push(`--max-count=${opts.maxCount || 500}`);
+    if (opts.skip && opts.skip > 0) { args.push(`--skip=${opts.skip}`); }
     if (opts.branch) { args.push(opts.branch); }
     if (opts.author) { args.push(`--author=${opts.author}`); }
     if (opts.after) { args.push(`--after=${opts.after}`); }
@@ -438,6 +439,49 @@ export class GitService {
     if (setUpstream) { args.push('-u', 'origin', branch); }
     else { args.push('origin', branch); }
     await this.git(repoPath, args);
+  }
+
+  private async getTrackingBranch(repoPath: string, branch: string): Promise<string | undefined> {
+    try {
+      const out = await this.git(repoPath, ['for-each-ref', `refs/heads/${branch}`, '--format=%(upstream:short)']);
+      const tracking = out.trim();
+      return tracking || undefined;
+    } catch { return undefined; }
+  }
+
+  private async getAheadBehind(repoPath: string, tracking: string, branch: string): Promise<{ ahead: number; behind: number }> {
+    try {
+      const out = await this.git(repoPath, ['rev-list', '--left-right', '--count', `${tracking}...${branch}`]);
+      const parts = out.trim().split(/\s+/);
+      if (parts.length < 2) { return { ahead: 0, behind: 0 }; }
+      const behind = parseInt(parts[0], 10) || 0;
+      const ahead = parseInt(parts[1], 10) || 0;
+      return { ahead, behind };
+    } catch {
+      return { ahead: 0, behind: 0 };
+    }
+  }
+
+  async smartPushBranch(repoPath: string, branch: string, setUpstream: boolean = false): Promise<{ rebased: boolean }> {
+    await this.fetchAll(repoPath);
+    const tracking = await this.getTrackingBranch(repoPath, branch);
+    if (!tracking) {
+      await this.pushBranch(repoPath, branch, setUpstream);
+      return { rebased: false };
+    }
+    const ab = await this.getAheadBehind(repoPath, tracking, branch);
+    if (ab.behind <= 0) {
+      await this.pushBranch(repoPath, branch, setUpstream);
+      return { rebased: false };
+    }
+    const cur = await this.getCurrentBranch(repoPath);
+    const switched = cur !== branch ? await this.smartCheckout(repoPath, branch) : { shelved: false, stashRef: undefined };
+    await this.rebaseBranch(repoPath, tracking);
+    await this.pushBranch(repoPath, branch, setUpstream);
+    if (switched.shelved) {
+      try { await this.unshelve(repoPath); } catch { /* ignore */ }
+    }
+    return { rebased: true };
   }
 
   async pullFromTracking(repoPath: string, tracking: string, useRebase: boolean): Promise<void> {
