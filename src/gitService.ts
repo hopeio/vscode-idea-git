@@ -449,28 +449,21 @@ export class GitService {
     } catch { return undefined; }
   }
 
-  private async getAheadBehind(repoPath: string, tracking: string, branch: string): Promise<{ ahead: number; behind: number }> {
-    try {
-      const out = await this.git(repoPath, ['rev-list', '--left-right', '--count', `${tracking}...${branch}`]);
-      const parts = out.trim().split(/\s+/);
-      if (parts.length < 2) { return { ahead: 0, behind: 0 }; }
-      const behind = parseInt(parts[0], 10) || 0;
-      const ahead = parseInt(parts[1], 10) || 0;
-      return { ahead, behind };
-    } catch {
-      return { ahead: 0, behind: 0 };
-    }
+  private isPushRejectedForBehind(err: any): boolean {
+    const msg = String(err?.stderr || err?.message || '');
+    return msg.includes('non-fast-forward') || msg.includes('[rejected]') || msg.includes('fetch first');
   }
 
   async smartPushBranch(repoPath: string, branch: string, setUpstream: boolean = false): Promise<{ rebased: boolean }> {
+    try {
+      await this.pushBranch(repoPath, branch, setUpstream);
+      return { rebased: false };
+    } catch (e) {
+      if (!this.isPushRejectedForBehind(e)) { throw e; }
+    }
     await this.fetchAll(repoPath);
     const tracking = await this.getTrackingBranch(repoPath, branch);
     if (!tracking) {
-      await this.pushBranch(repoPath, branch, setUpstream);
-      return { rebased: false };
-    }
-    const ab = await this.getAheadBehind(repoPath, tracking, branch);
-    if (ab.behind <= 0) {
       await this.pushBranch(repoPath, branch, setUpstream);
       return { rebased: false };
     }

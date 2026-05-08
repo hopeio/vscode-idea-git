@@ -202,10 +202,6 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
             await this.gitService.createBranch(repo, name, tracking);
             break;
           }
-          case 'checkoutRebase':
-            await this.gitService.smartCheckout(repo, tracking);
-            await this.gitService.rebaseBranch(repo, targetBranch);
-            break;
           case 'compare': {
             const files = await this.gitService.compareBranchFiles(repo, tracking, targetBranch);
             this.postMessage({ type: 'compareFiles', from: tracking, to: targetBranch, fromLabel: tracking, toLabel: targetBranch, files });
@@ -244,7 +240,6 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
           [
             { label: `Checkout '${tracking}'`, value: 'checkout' },
             { label: `New Branch from '${tracking}'...`, value: 'newBranch' },
-            { label: `Checkout and Rebase onto '${tracking}'`, value: 'checkoutRebase' },
             { label: `Compare with '${tracking}'`, value: 'compare' },
             { label: 'Show Diff with Working Tree', value: 'worktree' },
             { label: `Rebase '${targetBranch}' onto '${tracking}'`, value: 'rebase' },
@@ -262,10 +257,6 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         switch (pick.value) {
           case 'checkout':
             await this.gitService.smartCheckout(repo, tracking);
-            break;
-          case 'checkoutRebase':
-            await this.gitService.smartCheckout(repo, tracking);
-            await this.gitService.rebaseBranch(repo, targetBranch);
             break;
           case 'newBranch': {
             const name = await vscode.window.showInputBox({ prompt: `从 "${tracking}" 新建分支`, placeHolder: 'feature/new-branch' });
@@ -769,34 +760,30 @@ function bindBI(el){
     const tracking=el.dataset.tracking;
     const items=[];
     items.push({icon:'\\u21AA',label:'Checkout',action:()=>vscode.postMessage({type:'checkoutBranch',branch:br})});
+    items.push({icon:'\\u2B07',label:'Update',action:()=>vscode.postMessage({type:'pullBranch',branch:br})});
+    items.push({icon:'\\u{1F680}',label:'Push...',action:()=>vscode.postMessage({type:'pushBranch',branch:br,setUpstream:true})});
     items.push({icon:'\\u{1F33F}',label:'New Branch from \\''+br+'\\'...',action:()=>vscode.postMessage({type:'newBranchFrom',branch:br})});
-    if(!isCur){
-      items.push({icon:'\\u{1F501}',label:'Checkout and Rebase onto \\''+currentBranch+'\\'',action:()=>vscode.postMessage({type:'checkoutAndRebase',branch:br})});
-    }
-    items.push({sep:1});
-    if(!isCur){
-      items.push({icon:'\\u{1F50D}',label:'Compare with \\''+currentBranch+'\\'',action:()=>vscode.postMessage({type:'compareBranch',branch:br})});
-    }
-    items.push({icon:'\\u{1F4C4}',label:'Show Diff with Working Tree',action:()=>vscode.postMessage({type:'diffWithWorkingTree',branch:br})});
     items.push({sep:1});
     if(!isCur){
       items.push({icon:'\\u{1F501}',label:'Rebase \\''+currentBranch+'\\' onto \\''+br+'\\'',action:()=>vscode.postMessage({type:'rebaseOnto',branch:br})});
       items.push({icon:'\\u{1F500}',label:'Merge \\''+br+'\\' into \\''+currentBranch+'\\'',action:()=>vscode.postMessage({type:'mergeInto',branch:br})});
       items.push({sep:1});
     }
-    items.push({icon:'\\u2B07',label:'Update',action:()=>vscode.postMessage({type:'pullBranch',branch:br})});
-    items.push({icon:'\\u{1F680}',label:'Push...',action:()=>vscode.postMessage({type:'pushBranch',branch:br,setUpstream:true})});
+    if(!isCur){
+      items.push({icon:'\\u{1F50D}',label:'Compare with \\''+currentBranch+'\\'',action:()=>vscode.postMessage({type:'compareBranch',branch:br})});
+    }
+    items.push({icon:'\\u{1F4C4}',label:'Show Diff with Working Tree',action:()=>vscode.postMessage({type:'diffWithWorkingTree',branch:br})});
+    items.push({sep:1});
     if(tracking){
       items.push({icon:'\\u{1F517}',label:'Tracked Branch \\''+tracking+'\\'',children:[
         {icon:'\\u21AA',label:'Checkout',action:()=>vscode.postMessage({type:'trackedBranchAction',branch:br,tracking,action:'checkout'})},
         {icon:'\\u{1F33F}',label:'New Branch from \\''+tracking+'\\'...',action:()=>vscode.postMessage({type:'trackedBranchAction',branch:br,tracking,action:'newBranch'})},
-        {icon:'\\u{1F501}',label:'Checkout and Rebase onto \\''+tracking+'\\'',action:()=>vscode.postMessage({type:'trackedBranchAction',branch:br,tracking,action:'checkoutRebase'})},
-        {sep:1},
-        {icon:'\\u{1F50D}',label:'Compare with \\''+tracking+'\\'',action:()=>vscode.postMessage({type:'trackedBranchAction',branch:br,tracking,action:'compare'})},
-        {icon:'\\u{1F4C4}',label:'Show Diff with Working Tree',action:()=>vscode.postMessage({type:'trackedBranchAction',branch:br,tracking,action:'worktree'})},
         {sep:1},
         {icon:'\\u{1F501}',label:'Rebase \\''+br+'\\' onto \\''+tracking+'\\'',action:()=>vscode.postMessage({type:'trackedBranchAction',branch:br,tracking,action:'rebase'})},
         {icon:'\\u{1F500}',label:'Merge \\''+tracking+'\\' into \\''+br+'\\'',action:()=>vscode.postMessage({type:'trackedBranchAction',branch:br,tracking,action:'merge'})},
+        {sep:1},
+        {icon:'\\u{1F50D}',label:'Compare with \\''+tracking+'\\'',action:()=>vscode.postMessage({type:'trackedBranchAction',branch:br,tracking,action:'compare'})},
+        {icon:'\\u{1F4C4}',label:'Show Diff with Working Tree',action:()=>vscode.postMessage({type:'trackedBranchAction',branch:br,tracking,action:'worktree'})},
         {icon:'\\u2B07',label:'Pull into \\''+br+'\\' Using Rebase',action:()=>vscode.postMessage({type:'trackedBranchAction',branch:br,tracking,action:'pullRebase'})},
         {icon:'\\u2B07',label:'Pull into \\''+br+'\\' Using Merge',action:()=>vscode.postMessage({type:'trackedBranchAction',branch:br,tracking,action:'pullMerge'})}
       ]});
@@ -805,7 +792,6 @@ function bindBI(el){
     items.push({icon:'\\u270F',label:'Rename...',action:()=>vscode.postMessage({type:'renameBranch',branch:br})});
     if(!isCur){
       items.push({icon:'\\u{1F5D1}',label:'Delete',action:()=>vscode.postMessage({type:'deleteBranch',branch:br,force:false})});
-      items.push({icon:'\\u2620',label:'Force Delete',action:()=>vscode.postMessage({type:'deleteBranch',branch:br,force:true})});
     }
     showCtx(ev.clientX,ev.clientY,items);
   };
