@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { GitService, GitRepo, GitCommit, GitBranch, GitFileChange } from './gitService';
+import * as path from 'path';
 
 export class LogViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'ideaGit.logView';
@@ -70,6 +71,41 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       }
       case 'showDiff':
         await this.gitService.showFileDiff(repo, msg.hash, msg.filePath);
+        break;
+      case 'showDiffNewTab':
+        await this.gitService.showFileDiffInNewTab(repo, msg.hash, msg.filePath);
+        break;
+      case 'compareFileWithLocal':
+        await this.gitService.compareCommitFileWithLocal(repo, msg.hash, msg.filePath);
+        break;
+      case 'compareBeforeWithLocal':
+        await this.gitService.compareBeforeFileWithLocal(repo, msg.hash, msg.filePath);
+        break;
+      case 'openRepositoryVersion':
+        await this.gitService.openRepositoryVersion(repo, msg.hash, msg.filePath);
+        break;
+      case 'revertFileToHead':
+        await this.gitService.restoreFileFromHead(repo, msg.filePath);
+        vscode.window.showInformationMessage(`已恢复文件: ${msg.filePath}`);
+        await this.refresh();
+        break;
+      case 'checkoutFileFromRevision':
+        await this.gitService.checkoutFileFromRevision(repo, msg.hash, msg.filePath);
+        vscode.window.showInformationMessage(`已从 ${msg.hash.slice(0, 7)} 获取文件: ${msg.filePath}`);
+        await this.refresh();
+        break;
+      case 'createFilePatch': {
+        const uri = await vscode.window.showSaveDialog({ defaultUri: vscode.Uri.file(`${path.basename(msg.filePath)}.${msg.hash.slice(0, 7)}.patch`), filters: { 'Patch': ['patch'] } });
+        if (!uri) { break; }
+        await this.gitService.createFilePatch(repo, msg.hash, msg.filePath, uri.fsPath);
+        vscode.window.showInformationMessage(`Patch saved to ${uri.fsPath}`);
+        break;
+      }
+      case 'fileHistory':
+        await this.openFileHistoryPanel(repo, msg.filePath, msg.hash);
+        break;
+      case 'unsupportedFileAction':
+        vscode.window.showInformationMessage('该操作在当前版本按“文件级”暂不支持“选中部分变更”');
         break;
       case 'checkoutBranch': {
         try {
@@ -431,6 +467,70 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
 
   postMessage(msg: any) { this.view?.webview.postMessage(msg); }
 
+  private async openFileHistoryPanel(repo: string, filePath: string, uptoHash: string) {
+    const commits = await this.gitService.getFileHistory(repo, filePath, uptoHash);
+    const panel = vscode.window.createWebviewPanel(
+      'ideaGit.fileHistory',
+      `History Up to Here: ${path.basename(filePath)}`,
+      vscode.ViewColumn.Active,
+      { enableScripts: true, retainContextWhenHidden: true }
+    );
+    const firstHash = commits.length ? commits[0].hash : '';
+    const firstPatch = firstHash ? await this.gitService.getFilePatchAtCommit(repo, firstHash, filePath) : '';
+    const esc = (s: string) => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const initialCommits = JSON.stringify(commits.map(c => ({
+      hash: c.hash, abbrevHash: c.abbrevHash, author: c.author, date: c.date, message: c.message
+    })));
+    panel.webview.html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
+      body{margin:0;padding:0;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);font-family:var(--vscode-font-family);font-size:12px}
+      .wrap{display:flex;height:100vh}.left{width:280px;border-right:1px solid var(--vscode-panel-border);overflow:auto}
+      .right{flex:1;overflow:auto;padding:0}.item{padding:6px 10px;border-bottom:1px solid var(--vscode-panel-border);cursor:pointer}
+      .item:hover{background:var(--vscode-list-hoverBackground)}.item.sel{background:var(--vscode-list-activeSelectionBackground);color:var(--vscode-list-activeSelectionForeground)}
+      .m1{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.m2{color:var(--vscode-descriptionForeground);margin-top:2px}
+      .ph{position:sticky;top:0;background:var(--vscode-editor-background);border-bottom:1px solid var(--vscode-panel-border);padding:6px 10px;display:flex;gap:8px;align-items:center}
+      .b{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px}.b.add{background:#2ea04333;color:#3fb950}.b.del{background:#f8514933;color:#ff7b72}
+      #patch{padding:8px 10px;font-family:var(--vscode-editor-font-family,monospace);line-height:1.45;white-space:pre;overflow:auto}
+      .l{display:block}.l.h{color:#6ea8fe}.l.a{color:#3fb950;background:#2ea0431f}.l.d{color:#ff7b72;background:#f851491f}.l.m{color:#d2a8ff}
+      .l.c{color:#8b949e}.ctx{display:block;color:#79c0ff;cursor:pointer;background:#1f6feb22;padding:1px 6px;margin:1px 0;border-radius:4px}
+      .ctx:hover{background:#1f6feb44}
+    </style></head><body><div class="wrap"><div class="left" id="left"></div><div class="right"><div class="ph"><span class="b add" id="addCnt">+0</span><span class="b del" id="delCnt">-0</span></div><div id="patch"></div></div></div>
+      <script>
+      const vscode=acquireVsCodeApi(); const commits=${initialCommits}; const left=document.getElementById('left');
+      const esc=s=>(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      function render(sel){left.innerHTML=commits.map(c=>'<div class="item'+(c.hash===sel?' sel':'')+'" data-h="'+c.hash+'"><div class="m1">'+(c.message||'')+'</div><div class="m2">'+c.abbrevHash+'  '+c.author+'  '+(c.date||'').replace('T',' ').slice(0,16)+'</div></div>').join('');
+        left.querySelectorAll('.item').forEach(el=>el.onclick=()=>vscode.postMessage({type:'selectHistoryCommit',hash:el.dataset.h,selected:sel}));}
+      const ctxOpen=new Set();
+      function renderPatch(p){const lines=(p||'').split('\\n');let add=0,del=0,html='';let i=0,b=0;
+        while(i<lines.length){const ln=lines[i];
+          if(ln.startsWith(' ')){let j=i;while(j<lines.length&&lines[j].startsWith(' '))j++;const block=lines.slice(i,j);
+            const headKeep=2,tailKeep=2,minFold=7;
+            const folded=block.length>=minFold&&!ctxOpen.has(b);
+            if(folded){
+              for(const l of block.slice(0,headKeep)){html+='<span class="l c">'+esc(l)+'</span>';}
+              html+='<span class="ctx" data-b="'+b+'">↕ Show '+(block.length-headKeep-tailKeep)+' more context lines</span>';
+              for(const l of block.slice(-tailKeep)){html+='<span class="l c">'+esc(l)+'</span>';}
+            }else{
+              for(const l of block){html+='<span class="l c">'+esc(l)+'</span>';}
+            }
+            b++;i=j;continue;
+          }
+          let cls='';if(ln.startsWith('+++')||ln.startsWith('---')){cls='h';}
+          else if(ln.startsWith('@@')){cls='m';}else if(ln.startsWith('+')){cls='a';add++;}else if(ln.startsWith('-')){cls='d';del++;}
+          html+='<span class="l '+cls+'">'+esc(ln)+'</span>';i++;
+        }
+        const pEl=document.getElementById('patch');pEl.innerHTML=html;document.getElementById('addCnt').textContent='+'+add;document.getElementById('delCnt').textContent='-'+del;
+        pEl.querySelectorAll('.ctx').forEach(el=>{el.onclick=()=>{ctxOpen.add(Number(el.dataset.b));renderPatch(p);};});
+      }
+      render('${firstHash}');renderPatch(${JSON.stringify(firstPatch)});
+      window.addEventListener('message',e=>{const m=e.data; if(m.type==='historyPatch'){renderPatch(m.patch||''); render(m.hash||'');}});
+      </script></body></html>`;
+    panel.webview.onDidReceiveMessage(async (msg) => {
+      if (msg.type !== 'selectHistoryCommit' || !msg.hash) { return; }
+      const patch = await this.gitService.getFilePatchAtCommit(repo, msg.hash, filePath);
+      panel.webview.postMessage({ type: 'historyPatch', hash: msg.hash, patch });
+    });
+  }
+
   async refresh() {
     if (!this.view || !this.currentRepo) { return; }
     try {
@@ -581,6 +681,7 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size,13px
       <div class="bp-toolbar">
         <button class="toggle-btn active" id="bpTree" title="Tree view">Tree</button>
         <button class="toggle-btn" id="bpFlat" title="Flat view">Flat</button>
+        <button class="toggle-btn" id="bpCollapse" title="Collapse all">Collapse</button>
       </div>
       <div class="bp-content" id="bpContent"></div>
     </div>
@@ -601,7 +702,7 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size,13px
     <div class="resize-handle" id="resizeRight"></div>
     <div class="files-panel" id="filesPanel">
       <div class="fp-header">
-        <span id="fpTitle">Changed Files</span>
+        <span id="fpTitle">Changed</span>
         <div class="fp-btns">
           <button class="toggle-btn active" id="fpTree" title="Tree view">Tree</button>
           <button class="toggle-btn" id="fpFlat" title="Flat view">Flat</button>
@@ -621,6 +722,7 @@ let allCommits=[],allBranches=[],allTags=[],currentBranch='';
 let selectedHashes=new Set(),lastClickedIdx=-1;
 let branchViewMode='tree', filesViewMode='tree';
 let currentFilesHash=null, currentFiles=[], currentDetail=null, currentMergeGroups=null;
+const branchTreeOpen=new Set();
 const LOG_INITIAL_PAGE_SIZE=80;
 const LOG_PAGE_SIZE=200;
 let logHasMore=true,logLoadingMore=false,currentLoadFilters={};
@@ -679,10 +781,20 @@ $('repoSelect').onchange=e=>{
 /* ===== Branch Panel ===== */
 $('bpTree').onclick=()=>{branchViewMode='tree';$('bpTree').classList.add('active');$('bpFlat').classList.remove('active');renderBranches();};
 $('bpFlat').onclick=()=>{branchViewMode='flat';$('bpFlat').classList.add('active');$('bpTree').classList.remove('active');renderBranches();};
+$('bpCollapse').onclick=()=>{branchTreeOpen.clear();if(branchViewMode==='tree')renderBranches();};
 
 function renderBranches(){
   const p=$('bpContent'),lo=allBranches.filter(b=>!b.remote),rm=allBranches.filter(b=>b.remote);
+  const remotes=new Set();
+  for(const b of rm){const i=b.name.indexOf('/');if(i>0)remotes.add(b.name.slice(0,i));}
+  const singleRemote=remotes.size<=1;
+  const rmDisplay=rm.map(b=>{
+    const idx=b.name.indexOf('/');
+    if(singleRemote&&idx>0&&idx<b.name.length-1)return {...b,displayName:b.name.slice(idx+1)};
+    return {...b,displayName:b.name};
+  });
   let h='';
+  ensureCurrentBranchPathExpanded(lo,rmDisplay);
   if(currentBranch){
     h+='<div class="branch-item cur" data-branch="'+esc(currentBranch)+'" style="padding:5px 10px;font-weight:600">\\u2605 HEAD ('+eh(currentBranch)+')</div>';
   }
@@ -693,8 +805,8 @@ function renderBranches(){
   h+='</div>';
   h+=secHd('Remote');
   h+='<div class="sec-body">';
-  if(branchViewMode==='tree')h+=buildBTree(rm);
-  else for(const b of rm)h+=bLeaf(b,20);
+  if(branchViewMode==='tree')h+=buildBTree(rmDisplay);
+  else for(const b of rmDisplay)h+=bLeaf(b,20);
   h+='</div>';
   h+=secHd('Tags');
   h+='<div class="sec-body">';
@@ -721,9 +833,25 @@ function renderBranches(){
       el.querySelector('.arr').textContent=v?'\\u25BC':'\\u25B6';
       const ico=el.querySelector('.dir-ico');
       if(ico)ico.textContent=v?'\\u{1F4C2}':'\\u{1F4C1}';
+      const k=el.dataset.k;
+      if(k){if(v)branchTreeOpen.add(k);else branchTreeOpen.delete(k);}
     };
   });
   p.querySelectorAll('.branch-item').forEach(el=>{bindBI(el);});
+}
+
+function ensureCurrentBranchPathExpanded(localBranches,remoteBranches){
+  const all=localBranches.concat(remoteBranches);
+  const cur=all.find(b=>b.name===currentBranch);
+  if(!cur)return;
+  const disp=(cur.displayName||cur.name||'');
+  const pts=disp.split('/').filter(Boolean);
+  if(pts.length<=1)return;
+  let path='';
+  for(let i=0;i<pts.length-1;i++){
+    path=path?path+'/'+pts[i]:pts[i];
+    branchTreeOpen.add(path);
+  }
 }
 
 function secHd(t){return '<div class="sec-hd"><span class="arr">\\u25BC</span>'+eh(t)+'</div>';}
@@ -731,11 +859,12 @@ function secHd(t){return '<div class="sec-hd"><span class="arr">\\u25BC</span>'+
 function buildBTree(branches,isTag){
   const tree={};
   for(const b of branches){
-    const pts=b.name.split('/');let nd=tree;
+    const display=(b.displayName||b.name);
+    const pts=display.split('/');let nd=tree;
     for(let i=0;i<pts.length-1;i++){const k='d_'+pts[i];if(!nd[k])nd[k]={};nd=nd[k];}
     nd['L_'+b.name]=isTag?{...b,isTag:true}:b;
   }
-  return rBNode(tree,0);
+  return rBNode(tree,0,'');
 }
 
 function compactDirChain(name,node){
@@ -750,15 +879,17 @@ function compactDirChain(name,node){
   return {name:merged,node:cur};
 }
 
-function rBNode(nd,dep){
+function rBNode(nd,dep,parentPath){
   let h='';const indent=10+dep*16;const dirs=[],leaves=[];
   for(const k of Object.keys(nd)){if(k.startsWith('L_'))leaves.push(nd[k]);else if(k.startsWith('d_'))dirs.push({key:k.slice(2),node:nd[k]});}
   dirs.sort((a,b)=>a.key.localeCompare(b.key));
   for(const d of dirs){
     const c=compactDirChain(d.key,d.node);
     const compact=c.name.includes('/');
-    h+='<div class="tdir'+(compact?' compact':'')+'" style="padding-left:'+indent+'px"><span class="arr">\\u25BC</span><span class="dir-ico">\\u{1F4C2}</span><span class="path">'+eh(c.name)+'</span>'+(compact?'<span class="dir-hint">compact</span>':'')+'</div>';
-    h+='<div class="tdir-ch">';h+=rBNode(c.node,dep+1);h+='</div>';
+    const key=parentPath?parentPath+'/'+c.name:c.name;
+    const open=branchTreeOpen.has(key);
+    h+='<div class="tdir'+(compact?' compact':'')+'" data-k="'+esc(key)+'" style="padding-left:'+indent+'px"><span class="arr">'+(open?'\\u25BC':'\\u25B6')+'</span><span class="dir-ico">'+(open?'\\u{1F4C2}':'\\u{1F4C1}')+'</span><span class="path">'+eh(c.name)+'</span>'+(compact?'<span class="dir-hint">compact</span>':'')+'</div>';
+    h+='<div class="tdir-ch"'+(open?'':' style="display:none"')+'>';h+=rBNode(c.node,dep+1,key);h+='</div>';
   }
   for(const b of leaves)h+=bLeaf(b,indent+16);
   return h;
@@ -767,7 +898,8 @@ function rBNode(nd,dep){
 function bLeaf(b,indent){
   const c=b.name===currentBranch?' cur':'';
   const ico=b.isTag?'\\u{1F3F7}':(b.name===currentBranch?'\\u2B50':(b.remote?'\\u{1F310}':'\\u{1F33F}'));
-  const lbl=branchViewMode==='tree'?b.name.split('/').pop():b.name;
+  const display=(b.displayName||b.name);
+  const lbl=branchViewMode==='tree'?display.split('/').pop():display;
   let sync='';
   if(!b.remote){
     if((b.behind||0)>0)sync+='<span title="Need pull">\\u2199 '+b.behind+'</span>';
@@ -949,7 +1081,7 @@ $('fpFlat').onclick=()=>{filesViewMode='flat';$('fpFlat').classList.add('active'
 
 function renderFiles(files,hash){
   const l=$('filesList'),det=$('commitDetail');
-  $('fpTitle').textContent=files&&files.length?'Changed Files ('+files.length+')':'Changed Files';
+  $('fpTitle').textContent=files&&files.length?'Changed ('+files.length+')':'Changed';
   if(!files||!files.length){l.innerHTML='<div style="padding:10px;color:var(--desc)">No changed files</div>';det.classList.add('hidden');$('fpResize').classList.add('hidden');return;}
   let h='';
   if(currentMergeGroups){
@@ -1035,7 +1167,18 @@ function bindFI(c){c.querySelectorAll('.file-item').forEach(el=>{el.onclick=()=>
   if(el.dataset.mode==='worktree'){vscode.postMessage({type:'showWorkTreeDiff',ref:el.dataset.from,filePath:el.dataset.path});}
   else if(el.dataset.from){vscode.postMessage({type:'showBranchDiff',from:el.dataset.from,to:el.dataset.to,filePath:el.dataset.path});}
   else{vscode.postMessage({type:'showDiff',hash:el.dataset.hash,filePath:el.dataset.path});}
-};});}
+};el.oncontextmenu=e=>fileCtx(e,el);});}
+
+function fileCtx(e,el){
+  e.preventDefault();e.stopPropagation();
+  const fp=el.dataset.path,h=el.dataset.hash;
+  if(!fp||!h){return;}
+  showCtx(e.clientX,e.clientY,[
+    {icon:'\\u21A9',label:'Revert Selected Changes',action:()=>vscode.postMessage({type:'revertFileToHead',filePath:fp})},
+    {icon:'\\u{1F352}',label:'Cherry-Pick Selected Changes',action:()=>vscode.postMessage({type:'checkoutFileFromRevision',hash:h,filePath:fp})},
+    {icon:'\\u{1F553}',label:'History Up to Here',action:()=>vscode.postMessage({type:'fileHistory',hash:h,filePath:fp})}
+  ]);
+}
 
 function renderCompareFiles(from,to,files,fromLabel,toLabel,diffMode){
   const l=$('filesList'),det=$('commitDetail');

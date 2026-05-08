@@ -340,6 +340,94 @@ export class GitService {
     await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `${path.basename(filePath)} (${hash.slice(0, 7)})`);
   }
 
+  async showFileDiffInNewTab(repoPath: string, hash: string, filePath: string): Promise<void> {
+    const parents = await this.getCommitParents(repoPath, hash);
+    const parentHash = parents.length > 0 ? parents[0] : `${hash}~1`;
+    const leftUri = vscode.Uri.parse(`idea-git-diff:${filePath}?repo=${encodeURIComponent(repoPath)}&hash=${parentHash}`);
+    const rightUri = vscode.Uri.parse(`idea-git-diff:${filePath}?repo=${encodeURIComponent(repoPath)}&hash=${hash}`);
+    await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `${path.basename(filePath)} (${hash.slice(0, 7)})`, { preview: false });
+  }
+
+  async compareCommitFileWithLocal(repoPath: string, hash: string, filePath: string): Promise<void> {
+    const leftUri = vscode.Uri.parse(`idea-git-diff:${filePath}?repo=${encodeURIComponent(repoPath)}&hash=${hash}`);
+    const rightUri = vscode.Uri.file(path.join(repoPath, filePath));
+    await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `${path.basename(filePath)} (${hash.slice(0, 7)} vs Local)`);
+  }
+
+  async compareBeforeFileWithLocal(repoPath: string, hash: string, filePath: string): Promise<void> {
+    const parents = await this.getCommitParents(repoPath, hash);
+    const before = parents.length > 0 ? parents[0] : `${hash}~1`;
+    const leftUri = vscode.Uri.parse(`idea-git-diff:${filePath}?repo=${encodeURIComponent(repoPath)}&hash=${before}`);
+    const rightUri = vscode.Uri.file(path.join(repoPath, filePath));
+    await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `${path.basename(filePath)} (${before.slice(0, 7)} vs Local)`);
+  }
+
+  async openRepositoryVersion(repoPath: string, hash: string, filePath: string): Promise<void> {
+    const uri = vscode.Uri.parse(`idea-git-diff:${filePath}?repo=${encodeURIComponent(repoPath)}&hash=${hash}`);
+    const doc = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(doc, { preview: false });
+  }
+
+  async restoreFileFromHead(repoPath: string, filePath: string): Promise<void> {
+    await this.git(repoPath, ['restore', '--source=HEAD', '--', filePath]);
+  }
+
+  async checkoutFileFromRevision(repoPath: string, hash: string, filePath: string): Promise<void> {
+    await this.git(repoPath, ['checkout', hash, '--', filePath]);
+  }
+
+  async createFilePatch(repoPath: string, hash: string, filePath: string, outputPath: string): Promise<void> {
+    const parents = await this.getCommitParents(repoPath, hash);
+    const before = parents.length > 0 ? parents[0] : `${hash}~1`;
+    const patch = await this.git(repoPath, ['diff', '--binary', before, hash, '--', filePath]);
+    await fs.promises.writeFile(outputPath, patch);
+  }
+
+  async showFileHistory(repoPath: string, filePath: string): Promise<void> {
+    const terminal = vscode.window.createTerminal({ name: 'Git File History', cwd: repoPath });
+    terminal.sendText(`git log --follow -- "${filePath}"`);
+    terminal.show();
+  }
+
+  async getFileHistory(repoPath: string, filePath: string, uptoHash: string): Promise<GitCommit[]> {
+    const SEP = '\x1e';
+    const format = ['%H', '%h', '%an', '%aE', '%cn', '%cE', '%aI', '%at', '%s', '%P', '%D'].join(SEP);
+    const args = ['log', '--full-history', '--date-order', `--format=${format}`, '--decorate=short', uptoHash, '--', filePath];
+    let out: string;
+    try { out = await this.git(repoPath, args); } catch { return []; }
+    const commits: GitCommit[] = [];
+    for (const line of out.trim().split('\n')) {
+      if (!line) { continue; }
+      const parts = line.split(SEP);
+      if (parts.length < 11) { continue; }
+      const refs = parts[10] ? parts[10].split(',').map(r => r.trim()).filter(Boolean) : [];
+      commits.push({
+        hash: parts[0], abbrevHash: parts[1], author: parts[2], email: parts[3], committer: parts[4], committerEmail: parts[5],
+        date: parts[6], timestamp: parseInt(parts[7], 10), message: parts[8],
+        parents: parts[9] ? parts[9].split(' ').filter(Boolean) : [], refs
+      });
+    }
+    return commits;
+  }
+
+  async getFilePatchAtCommit(repoPath: string, hash: string, filePath: string): Promise<string> {
+    try {
+      const direct = await this.git(repoPath, ['show', '--patch', '--stat', '--pretty=fuller', hash, '--', filePath]);
+      if (direct.trim()) { return direct; }
+      const parents = await this.getCommitParents(repoPath, hash);
+      for (const parent of parents) {
+        const merged = await this.git(repoPath, ['diff', '--patch', '--stat', parent, hash, '--', filePath]);
+        if (merged.trim()) {
+          const header = await this.git(repoPath, ['show', '--no-patch', '--pretty=fuller', hash]);
+          return `${header}\n\n# Diff to parent ${parent.slice(0, 7)}\n${merged}`;
+        }
+      }
+      return direct;
+    } catch {
+      return '';
+    }
+  }
+
   async getFileContent(repoPath: string, hash: string, filePath: string): Promise<string> {
     try {
       return await this.git(repoPath, ['show', `${hash}:${filePath}`]);
