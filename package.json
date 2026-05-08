@@ -1,0 +1,131 @@
+{
+  "name": "idea-git",
+  "displayName": "IDEA Git",
+  "description": "IntelliJ IDEA style Git branch management, log viewer with commit graph, Smart Checkout and more.",
+  "version": "0.1.0",
+  "publisher": "hopeio",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/.git"
+  ],
+  "main": "./dist/extension.js",
+  "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hopeio/vscode-idea-git.git"
+  },
+  "contributes": {
+    "configuration": {
+      "title": "IDEA Git",
+      "properties": {
+        "ideaGit.autoFetch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically fetch remotes for discovered repositories."
+        },
+        "ideaGit.autoFetchIntervalSeconds": {
+          "type": "number",
+          "default": 300,
+          "minimum": 60,
+          "description": "Auto-fetch interval in seconds."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "ideaGit.switchBranch",
+        "title": "IDEA Git: Switch Branch"
+      },
+      {
+        "command": "ideaGit.createBranch",
+        "title": "IDEA Git: Create Branch"
+      },
+      {
+        "command": "ideaGit.renameBranch",
+        "title": "IDEA Git: Rename Branch"
+      },
+      {
+        "command": "ideaGit.deleteBranch",
+        "title": "IDEA Git: Delete Branch"
+      },
+      {
+        "command": "ideaGit.openLog",
+        "title": "IDEA Git: Open Git Log"
+      },
+      {
+        "command": "ideaGit.refresh",
+        "title": "IDEA Git: Refresh"
+      },
+      {
+        "command": "ideaGit.cherryPick",
+        "title": "Cherry-pick"
+      },
+      {
+        "command": "ideaGit.revertCommit",
+        "title": "Revert Commit"
+      },
+      {
+        "command": "ideaGit.interactiveRebase",
+        "title": "Interactive Rebase from Here"
+      },
+      {
+        "command": "ideaGit.showDiff",
+        "title": "Show Diff"
+      },
+      {
+        "command": "ideaGit.selectRepo",
+        "title": "IDEA Git: Select Repository"
+      }
+    ],
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "ideaGitPanel",
+          "title": "Git Log",
+          "icon": "$(git-branch)"
+        }
+      ]
+    },
+    "views": {
+      "ideaGitPanel": [
+        {
+          "type": "webview",
+          "id": "ideaGit.logView",
+          "name": "Git Log"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "ideaGit.refresh",
+          "when": "view == ideaGit.logView",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "lint": "eslint src --ext ts",
+    "vsce:package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.32.0",
+    "ts-loader": "^9.5.1",
+    "typescript": "^5.3.3",
+    "webpack": "^5.89.0",
+    "webpack-cli": "^5.1.4"
+  }
+}
