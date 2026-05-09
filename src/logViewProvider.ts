@@ -62,7 +62,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         const branches = await this.gitService.getBranches(repo);
         const currentBranch = await this.gitService.getCurrentBranch(repo);
         const tags = await this.gitService.getTags(repo);
-        this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, append: !!msg.append, hasMore: commits.length >= maxCount });
+        this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, append: !!msg.append, hasMore: commits.length >= maxCount, reqId: msg.reqId });
         break;
       }
       case 'selectCommit': {
@@ -147,6 +147,8 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
                 if (open === '打开冲突文件') { await this.gitService.openConflictFiles(repo, un.conflictFiles); }
               }
             }
+          } else if (result.forced) {
+            vscode.window.showWarningMessage(`已强制切换到分支: ${cur}（原工作区改动已丢弃）`);
           } else {
             vscode.window.showInformationMessage(`已切换到分支: ${cur}`);
           }
@@ -179,11 +181,12 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         break;
       }
       case 'checkoutAndRebase': {
-        const cur = await this.gitService.getCurrentBranch(repo);
+        const ontoRef = await this.gitService.getHeadAsRefForGit(repo);
+        const curDisplay = await this.gitService.getCurrentBranch(repo);
         const result = await this.gitService.smartCheckout(repo, msg.branch);
         if (result.shelved) { await vscode.window.showInformationMessage('已 Shelve 改动'); }
-        await this.gitService.rebaseBranch(repo, cur);
-        vscode.window.showInformationMessage(`已 Checkout ${msg.branch} 并 Rebase onto ${cur}`);
+        await this.gitService.rebaseBranch(repo, ontoRef);
+        vscode.window.showInformationMessage(`已 Checkout ${msg.branch} 并 Rebase onto ${ontoRef}（原在 ${curDisplay}）`);
         await this.refresh();
         break;
       }
@@ -209,20 +212,49 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         await this.gitService.showWorkTreeFileDiff(repo, msg.ref, msg.filePath);
         break;
       case 'rebaseOnto': {
-        const cur = await this.gitService.getCurrentBranch(repo);
-        const confirm = await vscode.window.showWarningMessage(`Rebase "${cur}" onto "${msg.branch}"？`, { modal: true }, '确定');
-        if (confirm !== '确定') { break; }
-        await this.gitService.rebaseBranch(repo, msg.branch);
-        vscode.window.showInformationMessage(`已 Rebase ${cur} onto ${msg.branch}`);
+        const curDisplay = await this.gitService.getCurrentBranch(repo);
+        const onBranch = await this.gitService.getSymbolicBranchShortName(repo);
+        if (!onBranch) {
+          const go = await vscode.window.showWarningMessage(
+            '当前为 detached HEAD：rebase 只会改写 HEAD 指向，完成后仍不在任何命名分支上（这是 Git 正常行为）。请先 checkout 到本地分支再 rebase，或确认仍要继续。',
+            '仍要继续', '取消'
+          );
+          if (go !== '仍要继续') { await this.refresh(); break; }
+        }
+        try {
+          await this.gitService.rebaseBranch(repo, msg.branch);
+          vscode.window.showInformationMessage(`已 Rebase ${curDisplay} onto ${msg.branch}`);
+        } catch (e: any) {
+          await this.handleRebaseConflict(repo, e);
+        }
         await this.refresh();
         break;
       }
       case 'mergeInto': {
         const cur = await this.gitService.getCurrentBranch(repo);
-        const confirm = await vscode.window.showWarningMessage(`Merge "${msg.branch}" into "${cur}"？`, { modal: true }, '确定');
-        if (confirm !== '确定') { break; }
-        await this.gitService.mergeBranch(repo, msg.branch);
-        vscode.window.showInformationMessage(`已 Merge ${msg.branch} into ${cur}`);
+        try {
+          await this.gitService.mergeBranch(repo, msg.branch);
+          vscode.window.showInformationMessage(`已 Merge ${msg.branch} into ${cur}`);
+        } catch (e: any) {
+          await this.handleMergeConflict(repo, e);
+        }
+        await this.refresh();
+        break;
+      }
+      case 'mergeCurrentInto': {
+        const mergeFromRef = await this.gitService.getHeadAsRefForGit(repo);
+        const curDisplay = await this.gitService.getCurrentBranch(repo);
+        try {
+          const switched = await this.gitService.smartCheckout(repo, msg.branch);
+          if (switched.shelved) {
+            vscode.window.showInformationMessage(`已 Shelve 改动并切换到 ${msg.branch}${switched.stashRef ? `（${switched.stashRef}）` : ''}`);
+          }
+          await this.gitService.mergeBranch(repo, mergeFromRef);
+          vscode.window.showInformationMessage(`已 Merge ${mergeFromRef}（原 ${curDisplay}）into ${msg.branch}`);
+        } catch (e: any) {
+          if (e?.message?.includes('用户取消')) { break; }
+          await this.handleMergeConflict(repo, e);
+        }
         await this.refresh();
         break;
       }
@@ -242,7 +274,10 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
             if (open === '打开冲突文件') { await this.gitService.openConflictFiles(repo, res.unshelveConflicts); }
           }
           await this.refresh();
-        } catch (e: any) { vscode.window.showErrorMessage(`Pull 失败: ${e.message}`); }
+        } catch (e: any) {
+          if (await this.gitService.isRebasing(repo)) { await this.handleRebaseConflict(repo, e); await this.refresh(); }
+          else { vscode.window.showErrorMessage(`Pull 失败: ${e.message}`); }
+        }
         break;
       }
       case 'trackedBranchAction': {
@@ -372,8 +407,25 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         break;
       }
       case 'deleteBranch': {
-        await this.gitService.deleteBranch(repo, msg.branch, !!msg.force);
-        vscode.window.showInformationMessage(`已删除 ${msg.branch}${msg.force ? '（强制）' : ''}`);
+        try {
+          await this.gitService.deleteBranch(repo, msg.branch, !!msg.force);
+          vscode.window.showInformationMessage(`已删除 ${msg.branch}${msg.force ? '（强制）' : ''}`);
+        } catch (e: any) {
+          const text = `${(e as { stderr?: unknown })?.stderr ?? ''}\n${e?.message ?? ''}`;
+          if (!msg.force && /not fully merged/i.test(text)) {
+            const pick = await vscode.window.showWarningMessage(
+              `分支 "${msg.branch}" 未完全合并到 HEAD，删除会丢失其独有提交。是否强制删除？`,
+              { modal: true, detail: '相当于 git branch -D（不可撤销，请先确认 reflog 仍可找回）。' },
+              '强制删除'
+            );
+            if (pick === '强制删除') {
+              await this.gitService.deleteBranch(repo, msg.branch, true);
+              vscode.window.showWarningMessage(`已强制删除 ${msg.branch}`);
+            }
+          } else {
+            vscode.window.showErrorMessage(`删除分支失败: ${e.message}`);
+          }
+        }
         await this.refresh();
         break;
       }
@@ -463,10 +515,6 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
           { placeHolder: `Reset HEAD 到 ${msg.hash.slice(0, 7)}，选择模式` }
         );
         if (!mode) { break; }
-        if (mode.detail === 'hard') {
-          const confirm = await vscode.window.showWarningMessage(`确定要 Hard Reset 到 ${msg.hash.slice(0, 7)}？所有改动将丢失！`, { modal: true }, '确定');
-          if (confirm !== '确定') { break; }
-        }
         await this.gitService.resetTo(repo, msg.hash, mode.detail as any);
         vscode.window.showInformationMessage(`已 ${mode.label} Reset 到 ${msg.hash.slice(0, 7)}`);
         await this.refresh();
@@ -631,6 +679,96 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       const patch = await this.gitService.getFilePatchAtCommit(repo, msg.hash, filePath);
       panel.webview.postMessage({ type: 'historyPatch', hash: msg.hash, patch });
     });
+  }
+
+  /** 切到 VS Code 内置源代码管理（Git）视图，在 Merge Changes 等区域解决冲突。 */
+  private async focusSourceControlForConflicts(): Promise<void> {
+    try { await vscode.commands.executeCommand('workbench.view.scm'); } catch { /* ignore */ }
+  }
+
+  /**
+   * Rebase 冲突循环引导：切到 Git 面板解决冲突 → Continue/Skip/Abort → 若仍冲突再循环。
+   * 子模块场景额外提供 "Fetch Submodules"，避免 `Could not read <oid>` 类问题。
+   */
+  private async handleRebaseConflict(repo: string, error: any): Promise<void> {
+    if (!(await this.gitService.isRebasing(repo))) {
+      vscode.window.showErrorMessage(`Rebase 失败: ${error?.message || error}`);
+      return;
+    }
+    const hasSubmodules = await this.gitService.hasSubmodules(repo);
+    const initialErr = `${(error as { stderr?: unknown })?.stderr ?? ''}\n${error?.message ?? ''}`;
+    const submoduleHint = /Recursive merging with submodules|each conflicted submodule|submoduleMergeConflict|Could not read [0-9a-f]{40}/i.test(initialErr);
+    let firstRound = true;
+    let lastAutoContinueFailed = false;
+    while (await this.gitService.isRebasing(repo)) {
+      const conflicts = await this.gitService.getConflictFiles(repo);
+      if (conflicts.length === 0 && !lastAutoContinueFailed) {
+        try { await this.gitService.rebaseContinue(repo); continue; }
+        catch (e: any) {
+          lastAutoContinueFailed = true;
+          vscode.window.showWarningMessage(`自动 Continue 失败: ${e?.message || e}`);
+          continue;
+        }
+      }
+      if (conflicts.length) { await this.focusSourceControlForConflicts(); }
+      const submoduleTip = (firstRound && submoduleHint)
+        ? '检测到子模块冲突：通常是父仓库提交里更新了子模块指针，需先到对应子模块仓库手动合并/更新到目标 commit，再回父仓库 git add 该子模块，最后 Continue。'
+        : '';
+      const tip = (conflicts.length
+        ? `Rebase 冲突: ${conflicts.length} 个文件待解决，已在源代码管理中打开。`
+        : 'Rebase 中: 自动 Continue 未通过，请手动选择操作。')
+        + (submoduleTip ? `\n${submoduleTip}` : '');
+      firstRound = false;
+      const buttons: string[] = ['Continue', 'Skip', 'Abort'];
+      if (hasSubmodules) { buttons.push('Fetch Submodules'); }
+      const action = await vscode.window.showWarningMessage(tip, ...buttons);
+      if (!action) { return; }
+      try {
+        if (action === 'Continue') { await this.gitService.rebaseContinue(repo); lastAutoContinueFailed = false; }
+        else if (action === 'Skip') { await this.gitService.rebaseSkip(repo); lastAutoContinueFailed = false; }
+        else if (action === 'Fetch Submodules') {
+          await this.gitService.submoduleSyncAndFetch(repo);
+          vscode.window.showInformationMessage('已同步并初始化子模块对象。可重试 Continue。');
+          lastAutoContinueFailed = false;
+        }
+        else { await this.gitService.rebaseAbort(repo); vscode.window.showInformationMessage('已 Abort Rebase'); return; }
+      } catch (e: any) {
+        vscode.window.showWarningMessage(`${action} 后仍有冲突: ${e?.message || e}`);
+      }
+    }
+    vscode.window.showInformationMessage('Rebase 已完成');
+  }
+
+  private async handleMergeConflict(repo: string, error: any): Promise<void> {
+    if (!(await this.gitService.isMerging(repo))) {
+      vscode.window.showErrorMessage(`Merge 失败: ${error?.message || error}`);
+      return;
+    }
+    let lastAutoCommitFailed = false;
+    while (await this.gitService.isMerging(repo)) {
+      const conflicts = await this.gitService.getConflictFiles(repo);
+      if (conflicts.length === 0 && !lastAutoCommitFailed) {
+        try { await this.gitService.mergeContinue(repo); continue; }
+        catch (e: any) {
+          lastAutoCommitFailed = true;
+          vscode.window.showWarningMessage(`自动 Commit 失败: ${e?.message || e}`);
+          continue;
+        }
+      }
+      if (conflicts.length) { await this.focusSourceControlForConflicts(); }
+      const tip = conflicts.length
+        ? `Merge 冲突: ${conflicts.length} 个文件待解决，已在源代码管理中打开。处理完后选择操作。`
+        : `Merge 中: 自动 Commit 未通过，请手动选择操作。`;
+      const action = await vscode.window.showWarningMessage(tip, 'Commit', 'Abort');
+      if (!action) { return; }
+      try {
+        if (action === 'Commit') { await this.gitService.mergeContinue(repo); lastAutoCommitFailed = false; }
+        else { await this.gitService.mergeAbort(repo); vscode.window.showInformationMessage('已 Abort Merge'); return; }
+      } catch (e: any) {
+        vscode.window.showWarningMessage(`${action} 后仍有冲突: ${e?.message || e}`);
+      }
+    }
+    vscode.window.showInformationMessage('Merge 已完成');
   }
 
   async refresh() {
@@ -849,12 +987,14 @@ const branchTreeOpen=new Set();
 const LOG_INITIAL_PAGE_SIZE=80;
 const LOG_PAGE_SIZE=200;
 let logHasMore=true,logLoadingMore=false,currentLoadFilters={};
+let lastIssuedLogReqId=0;
 const authorDirectory=new Set();
 const $=id=>document.getElementById(id);
 
 window.addEventListener('message',e=>{
   const m=e.data;
   if(m.type==='logData'){
+    if(m.reqId!=null&&m.reqId<lastIssuedLogReqId)return;
     if(m.activeFilters){
       filters.branch=m.activeFilters.branch||'';
       filters.author=m.activeFilters.author||'';
@@ -1035,8 +1175,27 @@ function bLeaf(b,indent){
 }
 
 function bindBI(el){
-  el.onclick=()=>{filters.branch=el.dataset.branch;applyF();highlightBranch(el.dataset.branch);};
-  el.ondblclick=()=>{filters.branch=el.dataset.branch;applyF();highlightBranch(el.dataset.branch);};
+  el.onclick=(e)=>{
+    if(e.detail>=2)return;
+    filters.branch=el.dataset.branch;applyF();highlightBranch(el.dataset.branch);
+  };
+  el.ondblclick=(ev)=>{
+    ev.preventDefault();ev.stopPropagation();
+    const br=el.dataset.branch;
+    const tracking=el.dataset.tracking;
+    let target=tracking;
+    if(!target){
+      const suffix='/'+br;
+      const candidates=allBranches.filter(b=>b.remote&&b.name.endsWith(suffix));
+      if(candidates.length===1)target=candidates[0].name;
+      else{
+        const origin=candidates.find(b=>b.name==='origin'+suffix);
+        if(origin)target=origin.name;
+      }
+    }
+    if(!target)target=br;
+    filters.branch=target;applyF();highlightBranch(target);
+  };
   el.oncontextmenu=ev=>{
     ev.preventDefault();ev.stopPropagation();
     const br=el.dataset.branch, isCur=el.classList.contains('cur');
@@ -1050,6 +1209,7 @@ function bindBI(el){
     if(!isCur){
       items.push({icon:'\\u{1F501}',label:'Rebase \\''+currentBranch+'\\' onto \\''+br+'\\'',action:()=>vscode.postMessage({type:'rebaseOnto',branch:br})});
       items.push({icon:'\\u{1F500}',label:'Merge \\''+br+'\\' into \\''+currentBranch+'\\'',action:()=>vscode.postMessage({type:'mergeInto',branch:br})});
+      items.push({icon:'\\u{1F500}',label:'Merge \\''+currentBranch+'\\' into \\''+br+'\\'',action:()=>vscode.postMessage({type:'mergeCurrentInto',branch:br})});
       items.push({sep:1});
     }
     if(!isCur){
@@ -1251,6 +1411,9 @@ function renderFiles(files,hash){
     let dh='<div style="font-weight:600;margin-bottom:6px">'+eh(currentDetail.message)+'</div>';
     if(currentDetail.fullHash){
       dh+='<div style="color:var(--desc);font-size:11px;margin-bottom:4px">'+currentDetail.fullHash.slice(0,9)+' '+eh(currentDetail.author)+' &lt;'+eh(currentDetail.email)+'&gt; on '+fD(currentDetail.date)+'</div>';
+      if(detailAuthorCommitterDiff(currentDetail)){
+        dh+='<div style="color:var(--desc);font-size:11px;margin-bottom:4px;opacity:.92">committed by '+eh(currentDetail.committer)+' &lt;'+eh(currentDetail.committerEmail)+'&gt; on '+fD(currentDetail.committerDate)+'</div>';
+      }
     }
     if(currentDetail.refs&&currentDetail.refs.length){
       dh+='<div style="margin-bottom:4px">'+currentDetail.refs.map(r=>{
@@ -1429,7 +1592,8 @@ function applyF(){
   currentLoadFilters=f;
   logHasMore=true;
   logLoadingMore=true;
-  vscode.postMessage({type:'loadLog',filters:f,skip:0,maxCount:LOG_INITIAL_PAGE_SIZE,append:false});
+  const rid=++lastIssuedLogReqId;
+  vscode.postMessage({type:'loadLog',filters:f,skip:0,maxCount:LOG_INITIAL_PAGE_SIZE,append:false,reqId:rid});
   renderFilterBar();
 }
 
@@ -1544,7 +1708,8 @@ $('logScroll').addEventListener('scroll',()=>{
   if(logLoadingMore||!logHasMore)return;
   if(sc.scrollTop+sc.clientHeight<sc.scrollHeight-120)return;
   logLoadingMore=true;
-  vscode.postMessage({type:'loadLog',filters:currentLoadFilters,skip:allCommits.length,maxCount:LOG_PAGE_SIZE,append:true});
+  const rid=++lastIssuedLogReqId;
+  vscode.postMessage({type:'loadLog',filters:currentLoadFilters,skip:allCommits.length,maxCount:LOG_PAGE_SIZE,append:true,reqId:rid});
 });
 
 /* ===== Resize ===== */
@@ -1633,6 +1798,11 @@ $('fpResize').onmousedown=e=>{
 function eh(s){return s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'):'';}
 function esc(s){return s?s.replace(/"/g,'&quot;').replace(/'/g,'&#39;'):'';}
 function fD(iso){try{const d=new Date(iso);return d.getFullYear()+'/'+(d.getMonth()+1).toString().padStart(2,'0')+'/'+d.getDate().toString().padStart(2,'0')+' '+d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');}catch(e){return iso;}}
+function detailAuthorCommitterDiff(d){
+  if(!d)return false;
+  const norm=s=>(s||'').trim().toLowerCase();
+  return norm(d.author)!==norm(d.committer)||norm(d.email)!==norm(d.committerEmail);
+}
 function fileChangeIcons(f){return '<span class="fst">'+fileStatusIcon(f.status)+'</span><span class="ftype">'+fileTypeIcon(f.path)+'</span>';}
 function fileTypeIcon(path){
   const base=((path||'').split('/').pop()||'').toLowerCase();

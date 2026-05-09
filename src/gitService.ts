@@ -96,6 +96,16 @@ export class GitService {
     return stdout;
   }
 
+  private gitErrText(err: unknown): string {
+    const o = err as { stderr?: unknown; message?: unknown };
+    return `${o.stderr != null ? String(o.stderr) : ''}\n${o.message != null ? String(o.message) : ''}`;
+  }
+
+  /** pull --rebase 遇子模块非平凡合并时 Git 会失败；据此决定是否可安全 abort 后改 merge 拉取。 */
+  private isSubmoduleRebasePullFailure(err: unknown): boolean {
+    return /Recursive merging with submodules|each conflicted submodule|submoduleMergeConflict|manually handle the merging of each conflicted submodule/i.test(this.gitErrText(err));
+  }
+
   async getBranches(repoPath: string): Promise<GitBranch[]> {
     const branches: GitBranch[] = [];
     const parse = (out: string, remote: boolean) => {
@@ -181,6 +191,23 @@ export class GitService {
     } catch { return '(unknown)'; }
   }
 
+  /** 在命名分支上返回短分支名；detached 返回 null（勿把 getCurrentBranch 的 UI 串传给 git）。 */
+  async getSymbolicBranchShortName(repoPath: string): Promise<string | null> {
+    try {
+      const out = (await this.git(repoPath, ['symbolic-ref', '-q', '--short', 'HEAD'])).trim();
+      return out || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** merge/rebase 的「上一处 HEAD」：分支名或 detached 时的完整 OID。 */
+  async getHeadAsRefForGit(repoPath: string): Promise<string> {
+    const sym = await this.getSymbolicBranchShortName(repoPath);
+    if (sym) { return sym; }
+    return (await this.git(repoPath, ['rev-parse', 'HEAD'])).trim();
+  }
+
   async checkout(repoPath: string, branch: string): Promise<void> {
     if (branch.startsWith('origin/')) {
       const localName = branch.replace(/^origin\//, '');
@@ -232,25 +259,45 @@ export class GitService {
     }
   }
 
-  async smartCheckout(repoPath: string, branch: string): Promise<{ shelved: boolean; stashRef?: string }> {
+  /** 强制切换：丢弃工作区改动后 checkout（remote 分支自动建本地跟踪分支）。 */
+  async forceCheckout(repoPath: string, branch: string): Promise<void> {
+    if (branch.startsWith('origin/')) {
+      const localName = branch.replace(/^origin\//, '');
+      try {
+        await this.git(repoPath, ['rev-parse', '--verify', localName]);
+        await this.git(repoPath, ['checkout', '-f', localName]);
+      } catch {
+        await this.git(repoPath, ['checkout', '-f', '-B', localName, '--track', branch]);
+      }
+    } else {
+      await this.git(repoPath, ['checkout', '-f', branch]);
+    }
+  }
+
+  async smartCheckout(repoPath: string, branch: string): Promise<{ shelved: boolean; forced: boolean; stashRef?: string }> {
     const dirty = await this.hasUncommittedChanges(repoPath);
     if (!dirty) {
       await this.checkout(repoPath, branch);
-      return { shelved: false, stashRef: undefined };
+      return { shelved: false, forced: false, stashRef: undefined };
     }
     try {
       await this.checkout(repoPath, branch);
-      return { shelved: false, stashRef: undefined };
+      return { shelved: false, forced: false, stashRef: undefined };
     } catch {
       const current = await this.getCurrentBranch(repoPath);
       const answer = await vscode.window.showWarningMessage(
-        `直接切换失败（存在冲突文件）。需要先暂存（Shelve）当前改动再切换到 "${branch}" 吗？`,
-        { modal: true }, 'Shelve & 切换', '取消'
+        `切换到 "${branch}" 失败：工作区有未提交改动且与目标分支冲突。`,
+        { modal: true, detail: 'Shelve & 切换：暂存当前改动后切换\n强制切换：丢弃当前改动后切换（不可恢复）' },
+        'Shelve & 切换', '强制切换'
       );
-      if (!answer || answer === '取消') { throw new Error('用户取消操作'); }
+      if (!answer) { throw new Error('用户取消操作'); }
+      if (answer === '强制切换') {
+        await this.forceCheckout(repoPath, branch);
+        return { shelved: false, forced: true, stashRef: undefined };
+      }
       const stashRef = await this.stash(repoPath, `smart-checkout: ${current} -> ${branch}`);
       await this.checkout(repoPath, branch);
-      return { shelved: true, stashRef };
+      return { shelved: true, forced: false, stashRef };
     }
   }
 
@@ -467,11 +514,11 @@ export class GitService {
 
   async getCommitDetail(repoPath: string, hash: string): Promise<any> {
     const SEP = '\x1e';
-    const info = (await this.git(repoPath, ['log', '-1', `--format=%H${SEP}%an${SEP}%ae${SEP}%aI${SEP}%D${SEP}%B`, hash]));
-    const idx = info.indexOf(SEP);
+    const info = (await this.git(repoPath, ['log', '-1', `--format=%H${SEP}%an${SEP}%ae${SEP}%aI${SEP}%cn${SEP}%ce${SEP}%cI${SEP}%D${SEP}%B`, hash]));
     const parts = info.split(SEP);
-    const fullHash = parts[0], author = parts[1], email = parts[2], date = parts[3], refsStr = parts[4];
-    const message = parts.slice(5).join(SEP).trim();
+    const fullHash = parts[0], author = parts[1], email = parts[2], date = parts[3];
+    const committer = parts[4], committerEmail = parts[5], committerDate = parts[6], refsStr = parts[7];
+    const message = parts.slice(8).join(SEP).trim();
     const refs = refsStr ? refsStr.split(',').map((r: string) => r.trim()).filter(Boolean) : [];
     const parentHashes = await this.getCommitParents(repoPath, hash);
     const parents: { hash: string; abbrev: string; message: string }[] = [];
@@ -480,7 +527,7 @@ export class GitService {
     }
     let branches: string[] = [];
     try { const out = await this.git(repoPath, ['branch', '-a', '--contains', hash, '--format=%(refname:short)']); branches = out.trim().split('\n').filter(Boolean); } catch { /* ignore */ }
-    return { message, fullHash, author, email, date, refs, parents, branches };
+    return { message, fullHash, author, email, date, committer, committerEmail, committerDate, refs, parents, branches };
   }
 
   async editCommitMessage(repoPath: string, hash: string, newMessage: string): Promise<void> {
@@ -503,8 +550,72 @@ export class GitService {
     await this.git(repoPath, ['rebase', onto]);
   }
 
+  /** 解析仓库的真实 git dir，兼容 submodule 中 `.git` 是文件的情况 */
+  private async resolveGitDir(repoPath: string): Promise<string | undefined> {
+    try {
+      const out = (await this.git(repoPath, ['rev-parse', '--git-dir'])).trim();
+      return path.isAbsolute(out) ? out : path.join(repoPath, out);
+    } catch { return undefined; }
+  }
+
+  private async pathExists(p: string): Promise<boolean> {
+    try { await fs.promises.stat(p); return true; } catch { return false; }
+  }
+
+  async isRebasing(repoPath: string): Promise<boolean> {
+    const dir = await this.resolveGitDir(repoPath);
+    if (!dir) { return false; }
+    return (await this.pathExists(path.join(dir, 'rebase-merge')))
+      || (await this.pathExists(path.join(dir, 'rebase-apply')));
+  }
+
+  async isMerging(repoPath: string): Promise<boolean> {
+    const dir = await this.resolveGitDir(repoPath);
+    if (!dir) { return false; }
+    return this.pathExists(path.join(dir, 'MERGE_HEAD'));
+  }
+
+  /** core.editor=true 让 git 在 commit message 阶段不阻塞编辑器 */
+  async rebaseContinue(repoPath: string): Promise<void> {
+    await this.git(repoPath, ['-c', 'core.editor=true', 'rebase', '--continue']);
+  }
+
+  async rebaseSkip(repoPath: string): Promise<void> {
+    await this.git(repoPath, ['rebase', '--skip']);
+  }
+
+  async rebaseAbort(repoPath: string): Promise<void> {
+    await this.git(repoPath, ['rebase', '--abort']);
+  }
+
+  async mergeContinue(repoPath: string): Promise<void> {
+    await this.git(repoPath, ['-c', 'core.editor=true', 'commit', '--no-edit']);
+  }
+
+  async mergeAbort(repoPath: string): Promise<void> {
+    await this.git(repoPath, ['merge', '--abort']);
+  }
+
+  /**
+   * 为父仓里被改动的子模块拉取最新对象（解决 `Could not read <oid>` 类问题）。
+   * 先 sync 配置 → init 缺失子模块 → 在每个子模块里 `git fetch --all`。
+   */
+  async submoduleSyncAndFetch(repoPath: string): Promise<void> {
+    try { await this.git(repoPath, ['submodule', 'sync', '--recursive']); } catch { /* ignore */ }
+    try { await this.git(repoPath, ['submodule', 'update', '--init', '--recursive']); } catch { /* ignore */ }
+    try { await this.git(repoPath, ['submodule', 'foreach', '--recursive', 'git fetch --all --prune']); } catch { /* ignore */ }
+  }
+
+  async hasSubmodules(repoPath: string): Promise<boolean> {
+    try {
+      const out = (await this.git(repoPath, ['config', '-f', '.gitmodules', '--get-regexp', '^submodule\\..*\\.path$'])).trim();
+      return !!out;
+    } catch { return false; }
+  }
+
+  /** Update 当前分支：固定 `pull --rebase`；冲突（含子模块）由调用方引导用户手动处理。 */
   async pullBranch(repoPath: string): Promise<void> {
-    await this.git(repoPath, ['pull']);
+    await this.git(repoPath, ['pull', '--rebase']);
   }
 
   async smartUpdateBranch(repoPath: string, branch: string): Promise<{ updated: boolean; shelved: boolean; branch: string; stashRef?: string; unshelveConflicts: string[] }> {
@@ -538,15 +649,13 @@ export class GitService {
     let stashRef: string | undefined;
     try {
       await this.pullBranch(repoPath);
-    } catch {
-      if (!shelved) {
-        const switched = await this.smartCheckout(repoPath, target);
-        shelved = switched.shelved;
-        stashRef = switched.stashRef;
-        await this.pullBranch(repoPath);
-      } else {
-        throw new Error('Pull 失败，请先处理本地冲突后重试');
-      }
+    } catch (e) {
+      // 已进入 rebase（含子模块/普通文件冲突）→ 不再尝试 smartCheckout/Shelve；交由上层的 handleRebaseConflict 引导处理
+      if (await this.isRebasing(repoPath)) { throw e; }
+      const switched = await this.smartCheckout(repoPath, target);
+      shelved = switched.shelved;
+      stashRef = switched.stashRef;
+      await this.pullBranch(repoPath);
     }
     let unshelveConflicts: string[] = [];
     if (shelved) {
@@ -622,7 +731,7 @@ export class GitService {
       return { rebased: false };
     }
     const cur = await this.getCurrentBranch(repoPath);
-    const switched = cur !== branch ? await this.smartCheckout(repoPath, branch) : { shelved: false, stashRef: undefined };
+    const switched = cur !== branch ? await this.smartCheckout(repoPath, branch) : { shelved: false, forced: false, stashRef: undefined };
     await this.rebaseBranch(repoPath, tracking);
     await this.pushBranch(repoPath, branch, setUpstream);
     if (switched.shelved) {

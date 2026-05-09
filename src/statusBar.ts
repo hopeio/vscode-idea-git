@@ -51,8 +51,11 @@ export class StatusBarManager {
         if (result.shelved) {
           const restore = await vscode.window.showInformationMessage(`已 Shelve 改动并切换到 ${branchName}。需要恢复之前的改动吗？`, '恢复 (Unshelve)', '稍后');
           if (restore === '恢复 (Unshelve)') { await this.gitService.unshelve(this.currentRepo.rootPath); }
+        } else if (result.forced) {
+          vscode.window.showWarningMessage(`已强制切换到分支: ${branchName}（原工作区改动已丢弃）`);
+        } else {
+          vscode.window.showInformationMessage(`已切换到分支: ${branchName}`);
         }
-        vscode.window.showInformationMessage(`已切换到分支: ${branchName}`);
       } catch (e: any) {
         if (!e.message?.includes('用户取消')) { vscode.window.showErrorMessage(`切换分支失败: ${e.message}`); }
       }

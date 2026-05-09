@@ -103,8 +103,22 @@ export async function activate(context: vscode.ExtensionContext) {
       const pick = await vscode.window.showQuickPick(items, { placeHolder: '选择要删除的分支' });
       if (!pick) { return; }
       try {
-        await gitService.deleteBranch(repo.rootPath, pick, false);
-        vscode.window.showInformationMessage(`已删除分支: ${pick}`);
+        try {
+          await gitService.deleteBranch(repo.rootPath, pick, false);
+          vscode.window.showInformationMessage(`已删除分支: ${pick}`);
+        } catch (e: any) {
+          const text = `${(e as { stderr?: unknown })?.stderr ?? ''}\n${e?.message ?? ''}`;
+          if (/not fully merged/i.test(text)) {
+            const force = await vscode.window.showWarningMessage(
+              `分支 "${pick}" 未完全合并到 HEAD，删除会丢失其独有提交。是否强制删除？`,
+              { modal: true, detail: '相当于 git branch -D（不可撤销，请先确认 reflog 仍可找回）。' },
+              '强制删除'
+            );
+            if (force !== '强制删除') { return; }
+            await gitService.deleteBranch(repo.rootPath, pick, true);
+            vscode.window.showWarningMessage(`已强制删除分支: ${pick}`);
+          } else { throw e; }
+        }
         await statusBar.refresh();
         logProvider.refresh();
       } catch (e: any) { vscode.window.showErrorMessage(`删除分支失败: ${e.message}`); }
