@@ -49,8 +49,17 @@ export class StatusBarManager {
       try {
         const result = await this.gitService.smartCheckout(this.currentRepo.rootPath, branchName);
         if (result.shelved) {
-          const restore = await vscode.window.showInformationMessage(`已 Shelve 改动并切换到 ${branchName}。需要恢复之前的改动吗？`, '恢复 (Unshelve)', '稍后');
-          if (restore === '恢复 (Unshelve)') { await this.gitService.unshelve(this.currentRepo.rootPath); }
+          const un = await this.gitService.unshelve(this.currentRepo.rootPath);
+          if (un.ok) {
+            vscode.window.showInformationMessage(`已切换到 ${branchName} 并自动恢复 Shelve 的改动${result.stashRef ? `（${result.stashRef}）` : ''}`);
+          } else {
+            const stashHint = result.stashRef ? `（已保留 ${result.stashRef}，可手动 git stash pop）` : '';
+            const open = await vscode.window.showWarningMessage(
+              `已切换到 ${branchName}，自动 Unshelve 出现冲突 ${un.conflictFiles.length} 个文件${stashHint}。`,
+              '打开源代码管理'
+            );
+            if (open === '打开源代码管理') { await vscode.commands.executeCommand('workbench.view.scm'); }
+          }
         } else if (result.forced) {
           vscode.window.showWarningMessage(`已强制切换到分支: ${branchName}（原工作区改动已丢弃）`);
         } else {

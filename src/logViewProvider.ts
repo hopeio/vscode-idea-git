@@ -130,27 +130,10 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         try {
           const result = await this.gitService.smartCheckout(repo, msg.branch);
           const cur = await this.gitService.getCurrentBranch(repo);
-          if (result.shelved) {
-            const restore = await vscode.window.showInformationMessage(
-              `已 Shelve 改动并切换到 ${cur}${result.stashRef ? `（${result.stashRef}）` : ''}。是否恢复之前的改动？`,
-              '恢复 (Unshelve)', '稍后手动恢复'
-            );
-            if (restore === '恢复 (Unshelve)') {
-              const un = await this.gitService.unshelve(repo);
-              if (un.ok) {
-                vscode.window.showInformationMessage('改动已恢复');
-              } else {
-                const open = await vscode.window.showWarningMessage(
-                  `Unshelve 出现冲突${result.stashRef ? `（${result.stashRef}）` : ''}，共 ${un.conflictFiles.length} 个文件。`,
-                  '打开冲突文件'
-                );
-                if (open === '打开冲突文件') { await this.gitService.openConflictFiles(repo, un.conflictFiles); }
-              }
-            }
-          } else if (result.forced) {
+          if (result.forced) {
             vscode.window.showWarningMessage(`已强制切换到分支: ${cur}（原工作区改动已丢弃）`);
           } else {
-            vscode.window.showInformationMessage(`已切换到分支: ${cur}`);
+            await this.tryAutoUnshelve(repo, result, `已切换到分支: ${cur}`);
           }
           this.postMessage({ type: 'branchSwitched', branch: cur });
         } catch (e: any) {
@@ -184,9 +167,10 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         const ontoRef = await this.gitService.getHeadAsRefForGit(repo);
         const curDisplay = await this.gitService.getCurrentBranch(repo);
         const result = await this.gitService.smartCheckout(repo, msg.branch);
-        if (result.shelved) { await vscode.window.showInformationMessage('已 Shelve 改动'); }
-        await this.gitService.rebaseBranch(repo, ontoRef);
-        vscode.window.showInformationMessage(`已 Checkout ${msg.branch} 并 Rebase onto ${ontoRef}（原在 ${curDisplay}）`);
+        try {
+          await this.gitService.rebaseBranch(repo, ontoRef);
+          await this.tryAutoUnshelve(repo, result, `已 Checkout ${msg.branch} 并 Rebase onto ${ontoRef}（原在 ${curDisplay}）`);
+        } catch (e: any) { await this.handleRebaseConflict(repo, e); }
         await this.refresh();
         break;
       }
@@ -244,13 +228,11 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       case 'mergeCurrentInto': {
         const mergeFromRef = await this.gitService.getHeadAsRefForGit(repo);
         const curDisplay = await this.gitService.getCurrentBranch(repo);
+        let switched: { shelved: boolean; forced: boolean; stashRef?: string } = { shelved: false, forced: false };
         try {
-          const switched = await this.gitService.smartCheckout(repo, msg.branch);
-          if (switched.shelved) {
-            vscode.window.showInformationMessage(`已 Shelve 改动并切换到 ${msg.branch}${switched.stashRef ? `（${switched.stashRef}）` : ''}`);
-          }
+          switched = await this.gitService.smartCheckout(repo, msg.branch);
           await this.gitService.mergeBranch(repo, mergeFromRef);
-          vscode.window.showInformationMessage(`已 Merge ${mergeFromRef}（原 ${curDisplay}）into ${msg.branch}`);
+          await this.tryAutoUnshelve(repo, switched, `已 Merge ${mergeFromRef}（原 ${curDisplay}）into ${msg.branch}`);
         } catch (e: any) {
           if (e?.message?.includes('用户取消')) { break; }
           await this.handleMergeConflict(repo, e);
@@ -684,6 +666,22 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
   /** 切到 VS Code 内置源代码管理（Git）视图，在 Merge Changes 等区域解决冲突。 */
   private async focusSourceControlForConflicts(): Promise<void> {
     try { await vscode.commands.executeCommand('workbench.view.scm'); } catch { /* ignore */ }
+  }
+
+  /** 切分支后若产生 Shelve（stash），自动尝试 Unshelve；冲突时引导到源代码管理。 */
+  private async tryAutoUnshelve(repo: string, switched: { shelved: boolean; stashRef?: string }, successMsg: string): Promise<void> {
+    if (!switched.shelved) { vscode.window.showInformationMessage(successMsg); return; }
+    const un = await this.gitService.unshelve(repo);
+    if (un.ok) {
+      vscode.window.showInformationMessage(`${successMsg}；已自动恢复 Shelve 的改动${switched.stashRef ? `（${switched.stashRef}）` : ''}`);
+      return;
+    }
+    const stashHint = switched.stashRef ? `（已保留 ${switched.stashRef}，可手动 git stash pop）` : '';
+    const open = await vscode.window.showWarningMessage(
+      `${successMsg}；自动 Unshelve 出现冲突 ${un.conflictFiles.length} 个文件${stashHint}。`,
+      '打开源代码管理'
+    );
+    if (open === '打开源代码管理') { await this.focusSourceControlForConflicts(); }
   }
 
   /**
