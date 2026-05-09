@@ -6,12 +6,28 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'ideaGit.logView';
   private static readonly INITIAL_PAGE_SIZE = 80;
   private static readonly PAGE_SIZE = 200;
+  /** Webview filter pill + git log; sync embedded script FILTER_AUTHOR_ME */
+  private static readonly filterAuthorMe = '__ideaGit_me__';
   private view?: vscode.WebviewView;
   private currentRepo?: GitRepo;
   private currentLogFilters: { branch?: string; author?: string; after?: string; before?: string; path?: string } = {};
   private defaultBranchFilterAppliedRepo?: string;
 
   constructor(private extensionUri: vscode.Uri, private gitService: GitService) {}
+
+  private async buildGetLogOpts(repo: string, filters: { branch?: string; author?: string; after?: string; before?: string; path?: string }, skip: number, maxCount: number) {
+    const opts: {
+      maxCount: number; skip: number; branch?: string; author?: string; authorPatterns?: string[]; after?: string; before?: string; path?: string;
+    } = { maxCount, skip, branch: filters.branch, after: filters.after, before: filters.before, path: filters.path };
+    if (filters.author === LogViewProvider.filterAuthorMe) {
+      const patterns = await this.gitService.getMeAuthorPatterns(repo);
+      if (!patterns.length) return { opts, emptyMe: true as const };
+      opts.authorPatterns = patterns;
+      return { opts, emptyMe: false as const };
+    }
+    if (filters.author) opts.author = filters.author;
+    return { opts, emptyMe: false as const };
+  }
 
   setRepo(repo: GitRepo) { this.currentRepo = repo; }
   getCurrentRepo(): GitRepo | undefined { return this.currentRepo; }
@@ -39,7 +55,8 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         const skip = Number(msg.skip || 0);
         const defaultCount = skip > 0 ? LogViewProvider.PAGE_SIZE : LogViewProvider.INITIAL_PAGE_SIZE;
         const maxCount = Number(msg.maxCount || defaultCount);
-        const commits = await this.gitService.getLog(repo, { ...filters, skip, maxCount });
+        const { opts, emptyMe } = await this.buildGetLogOpts(repo, filters, skip, maxCount);
+        const commits = emptyMe ? [] : await this.gitService.getLog(repo, opts);
         const branches = await this.gitService.getBranches(repo);
         const currentBranch = await this.gitService.getCurrentBranch(repo);
         const tags = await this.gitService.getTags(repo);
@@ -625,7 +642,8 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         this.currentLogFilters = { branch: currentBranch };
         this.defaultBranchFilterAppliedRepo = repo;
       }
-      const commits = await this.gitService.getLog(repo, { ...this.currentLogFilters, maxCount: LogViewProvider.INITIAL_PAGE_SIZE });
+      const { opts, emptyMe } = await this.buildGetLogOpts(repo, this.currentLogFilters, 0, LogViewProvider.INITIAL_PAGE_SIZE);
+      const commits = emptyMe ? [] : await this.gitService.getLog(repo, opts);
       const repos = this.gitService.getRepos();
       this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, repos, currentRepoPath: repo, activeFilters: this.currentLogFilters, append: false, hasMore: commits.length >= LogViewProvider.INITIAL_PAGE_SIZE });
     } catch (e: any) { vscode.window.showErrorMessage(`刷新失败: ${e.message}`); }
@@ -718,6 +736,7 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size,13px
 .file-item{padding:3px 10px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .file-item:hover{background:var(--hover)}
 .fst{width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
+.ftype{width:18px;height:16px;display:inline-flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;opacity:.92}
 .fdir{padding:3px 10px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:4px;color:var(--desc);user-select:none}
 .fdir:hover{background:var(--hover)}
 .fdir .arr{display:inline-block;width:10px;font-size:10px}
@@ -800,6 +819,7 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size,13px
 <div class="ctx-menu hidden" id="ctxSubMenu"></div>
 <script>
 const vscode=acquireVsCodeApi();
+const FILTER_AUTHOR_ME='${LogViewProvider.filterAuthorMe}';
 let allCommits=[],allBranches=[],allTags=[],currentBranch='';
 let selectedHashes=new Set(),lastClickedIdx=-1;
 let branchViewMode='tree', filesViewMode='tree';
@@ -808,6 +828,7 @@ const branchTreeOpen=new Set();
 const LOG_INITIAL_PAGE_SIZE=80;
 const LOG_PAGE_SIZE=200;
 let logHasMore=true,logLoadingMore=false,currentLoadFilters={};
+const authorDirectory=new Set();
 const $=id=>document.getElementById(id);
 
 window.addEventListener('message',e=>{
@@ -822,6 +843,7 @@ window.addEventListener('message',e=>{
       $('pathInput').value=filters.path||'';
     }
     const incoming=m.commits||[];
+    for(const c of incoming){if(c.author)authorDirectory.add(c.author);}
     if(m.append){
       const seen=new Set(allCommits.map(c=>c.hash));
       for(const c of incoming){if(!seen.has(c.hash))allCommits.push(c);}
@@ -857,6 +879,7 @@ $('repoSelect').onchange=e=>{
   filters.branch='';filters.author='';filters.after='';filters.before='';filters.path='';
   $('branchInput').value='';$('searchInput').value='';$('pathInput').value='';
   filterBranchPanel('');renderFilterBar();
+  authorDirectory.clear();
   vscode.postMessage({type:'switchRepo',repoPath:e.target.value});
 };
 
@@ -1224,7 +1247,7 @@ function renderFiles(files,hash){
 }
 
 function buildFFlat(files,hash){
-  let h='';for(const f of files)h+='<div class="file-item" data-path="'+esc(f.path)+'" data-hash="'+hash+'"><span class="fst">'+fileStatusIcon(f.status)+'</span><span title="'+esc(f.path)+'">'+eh(f.path)+'</span></div>';
+  let h='';for(const f of files)h+='<div class="file-item" data-path="'+esc(f.path)+'" data-hash="'+hash+'">'+fileChangeIcons(f)+'<span title="'+esc(f.path)+'">'+eh(f.path)+'</span></div>';
   return h;
 }
 function buildFTree(files,hash){
@@ -1242,7 +1265,7 @@ function rFNode(nd,hash,dep){
     h+='<div class="fdir-ch">';h+=rFNode(c.node,hash,dep+1);h+='</div>';
   }
   for(const f of leaves){const nm=f.path.split('/').pop();
-    h+='<div class="file-item" data-path="'+esc(f.path)+'" data-hash="'+hash+'" style="padding-left:'+(indent+16)+'px"><span class="fst">'+fileStatusIcon(f.status)+'</span><span title="'+esc(f.path)+'">'+eh(nm)+'</span></div>';}
+    h+='<div class="file-item" data-path="'+esc(f.path)+'" data-hash="'+hash+'" style="padding-left:'+(indent+16)+'px">'+fileChangeIcons(f)+'<span title="'+esc(f.path)+'">'+eh(nm)+'</span></div>';}
   return h;
 }
 function bindFI(c){c.querySelectorAll('.file-item').forEach(el=>{el.onclick=()=>{
@@ -1294,7 +1317,7 @@ function rCmpNode(nd,from,to,dep,mode){
     h+='<div class="fdir-ch">';h+=rCmpNode(c.node,from,to,dep+1,mode);h+='</div>';
   }
   for(const f of leaves){const nm=f.path.split('/').pop();
-    h+='<div class="file-item" data-path="'+esc(f.path)+'" data-from="'+esc(from)+'" data-to="'+esc(to)+'"'+(mode?' data-mode="'+mode+'"':'')+' style="padding-left:'+(indent+16)+'px"><span class="fst">'+fileStatusIcon(f.status)+'</span><span title="'+esc(f.path)+'">'+eh(nm)+'</span></div>';}
+    h+='<div class="file-item" data-path="'+esc(f.path)+'" data-from="'+esc(from)+'" data-to="'+esc(to)+'"'+(mode?' data-mode="'+mode+'"':'')+' style="padding-left:'+(indent+16)+'px">'+fileChangeIcons(f)+'<span title="'+esc(f.path)+'">'+eh(nm)+'</span></div>';}
   return h;
 }
 
@@ -1390,7 +1413,7 @@ function renderFilterBar(){
   const area=$('filterArea');let h='';
   const active=hasAnyFilter();
   const bLabel=filters.branch?'Branch: '+eh(filters.branch):'Branch';
-  const uLabel=filters.author?'User: '+eh(filters.author):'User';
+  const uLabel=filters.author?(filters.author===FILTER_AUTHOR_ME?'User: Me':'User: '+eh(filters.author)):'User';
   let dLabel='Date';
   if(filters.after||filters.before){dLabel='Date: ';if(filters.after)dLabel+=filters.after;dLabel+='~';if(filters.before)dLabel+=filters.before;}
   h+='<div class="pill'+(filters.branch?' on':'')+' btn" data-act="branch"><span>'+bLabel+'</span>'+(filters.branch?'<span class="x" data-k="branch">\\u00D7</span>':'')+'</div>';
@@ -1414,9 +1437,9 @@ function onPillBtn(act,ev){
     const items=allBranches.map(b=>({label:b.name,action:()=>{filters.branch=b.name;applyF();highlightBranch(b.name);lastPillAct='';}}));
     setTimeout(()=>showCtx(rect.left,rect.bottom+2,items),0);
   }else if(act==='user'){
-    const seen=new Set();const authors=[];
-    for(const c of allCommits){if(c.author&&!seen.has(c.author)){seen.add(c.author);authors.push(c.author);}}
-    const items=authors.map(a=>({label:a,action:()=>{filters.author=a;applyF();lastPillAct='';}}));
+    const authors=[...authorDirectory];
+    authors.sort((a,b)=>a.localeCompare(b));
+    const items=[{label:'Me',action:()=>{filters.author=FILTER_AUTHOR_ME;applyF();lastPillAct='';}},{sep:1},...authors.map(a=>({label:a,action:()=>{filters.author=a;applyF();lastPillAct='';}}))];
     setTimeout(()=>showCtx(rect.left,rect.bottom+2,items),0);
   }else if(act==='date'){
     dp.style.display='flex';
@@ -1579,6 +1602,39 @@ $('fpResize').onmousedown=e=>{
 function eh(s){return s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'):'';}
 function esc(s){return s?s.replace(/"/g,'&quot;').replace(/'/g,'&#39;'):'';}
 function fD(iso){try{const d=new Date(iso);return d.getFullYear()+'/'+(d.getMonth()+1).toString().padStart(2,'0')+'/'+d.getDate().toString().padStart(2,'0')+' '+d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');}catch(e){return iso;}}
+function fileChangeIcons(f){return '<span class="fst">'+fileStatusIcon(f.status)+'</span><span class="ftype">'+fileTypeIcon(f.path)+'</span>';}
+function fileTypeIcon(path){
+  const base=((path||'').split('/').pop()||'').toLowerCase();
+  if(base==='dockerfile'||base.endsWith('.dockerfile'))return '\\u{1F433}';
+  if(base==='makefile'||base==='cmakelists.txt'||base==='cmakelists.txt.in')return '\\u{1F527}';
+  if(base==='package.json'||base==='package-lock.json'||base==='pnpm-lock.yaml'||base==='yarn.lock')return '\\u{1F4E6}';
+  if(base==='go.mod'||base==='go.sum'||base==='go.work')return '\\u{1F439}';
+  const dot=base.lastIndexOf('.');
+  const ext=dot>=0?base.slice(dot+1):'';
+  const m={
+    go:'\\u{1F439}',ts:'\\u{1F4D8}',tsx:'\\u269B\\uFE0F',mts:'\\u{1F4D8}',cts:'\\u{1F4D8}',
+    js:'\\u{1F4DC}',jsx:'\\u269B\\uFE0F',mjs:'\\u{1F4DC}',cjs:'\\u{1F4DC}',vue:'\\u{1F49A}',svelte:'\\u{1F536}',
+    py:'\\u{1F40D}',pyw:'\\u{1F40D}',java:'\\u2615',kt:'\\u{1F538}',kts:'\\u{1F538}',
+    rs:'\\u{1F980}',rb:'\\u{1F48E}',php:'\\u{1F418}',swift:'\\u{1F426}',cs:'\\u{1F537}',
+    cpp:'\\u2699\\uFE0F',cc:'\\u2699\\uFE0F',cxx:'\\u2699\\uFE0F',hpp:'\\u2699\\uFE0F',hh:'\\u2699\\uFE0F',c:'\\u2699\\uFE0F',h:'\\u2699\\uFE0F',
+    css:'\\u{1F3A8}',scss:'\\u{1F3A8}',sass:'\\u{1F3A8}',less:'\\u{1F3A8}',
+    html:'\\u{1F310}',htm:'\\u{1F310}',
+    md:'\\u{1F4DD}',mdx:'\\u{1F4DD}',
+    json:'\\u{1F4CB}',jsonc:'\\u{1F4CB}',
+    yaml:'\\u2699\\uFE0F',yml:'\\u2699\\uFE0F',toml:'\\u2699\\uFE0F',
+    xml:'\\u{1F4F0}',plist:'\\u{1F4F0}',
+    sql:'\\u{1F5C4}\\uFE0F',
+    sh:'\\u{1F4BB}',bash:'\\u{1F4BB}',zsh:'\\u{1F4BB}',fish:'\\u{1F4BB}',ps1:'\\u{1F4BB}',
+    png:'\\u{1F5BC}\\uFE0F',jpg:'\\u{1F5BC}\\uFE0F',jpeg:'\\u{1F5BC}\\uFE0F',gif:'\\u{1F5BC}\\uFE0F',webp:'\\u{1F5BC}\\uFE0F',svg:'\\u{1F5BC}\\uFE0F',ico:'\\u{1F5BC}\\uFE0F',
+    wasm:'\\u{1F680}',lock:'\\u{1F512}',
+    gradle:'\\u2615',properties:'\\u2699\\uFE0F',env:'\\u{1F510}',
+    woff:'\\u{1F524}',woff2:'\\u{1F524}',ttf:'\\u{1F524}',eot:'\\u{1F524}',
+    pdf:'\\u{1F4C4}',zip:'\\u{1F4E6}',gz:'\\u{1F4E6}',tar:'\\u{1F4E6}',
+  };
+  if(ext&&m[ext])return m[ext];
+  if(base.endsWith('.d.ts'))return '\\u{1F4D8}';
+  return '\\u{1F4C4}';
+}
 function fileStatusIcon(st){if(st==='A')return '\\u{1F195}';if(st==='M')return '\\u270F\\uFE0F';if(st==='D')return '\\u{1F5D1}\\uFE0F';if(st==='R')return '\\u{1F501}';if(st==='C')return '\\u{1F4CB}';return '\\u{1F4C4}';}
 function norm(s){return (s||'').trim().toLowerCase();}
 function isAuthorDifferentFromCommitter(c){

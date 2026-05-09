@@ -155,6 +155,20 @@ export class GitService {
     try { return (await this.git(repoPath, ['config', 'user.name'])).trim(); } catch { return ''; }
   }
 
+  /** Patterns for `git log --author=<regex>` (OR when repeated). */
+  async getMeAuthorPatterns(repoPath: string): Promise<string[]> {
+    const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const emails = await this.getUserEmails(repoPath);
+    const name = (await this.getUserName(repoPath)).trim();
+    const patterns: string[] = [];
+    for (const e of emails) {
+      const t = e.trim();
+      if (t) patterns.push(esc(t));
+    }
+    if (name) patterns.push(esc(name));
+    return patterns;
+  }
+
   async getCurrentBranch(repoPath: string): Promise<string> {
     try {
       const out = await this.git(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
@@ -244,7 +258,7 @@ export class GitService {
     return this.stashPop(repoPath);
   }
 
-  async getLog(repoPath: string, opts: { maxCount?: number; skip?: number; branch?: string; author?: string; after?: string; before?: string; path?: string } = {}): Promise<GitCommit[]> {
+  async getLog(repoPath: string, opts: { maxCount?: number; skip?: number; branch?: string; author?: string; authorPatterns?: string[]; after?: string; before?: string; path?: string } = {}): Promise<GitCommit[]> {
     const SEP = '\x1e';
     const REC = '\x1f';
     const format = ['%H', '%h', '%an', '%aE', '%cn', '%cE', '%aI', '%at', '%s', '%P', '%D'].join(SEP);
@@ -252,7 +266,9 @@ export class GitService {
     args.push(`--max-count=${opts.maxCount || 500}`);
     if (opts.skip && opts.skip > 0) { args.push(`--skip=${opts.skip}`); }
     if (opts.branch) { args.push(opts.branch); }
-    if (opts.author) { args.push(`--author=${opts.author}`); }
+    if (opts.authorPatterns?.length) {
+      for (const p of opts.authorPatterns) { args.push(`--author=${p}`); }
+    } else if (opts.author) { args.push(`--author=${opts.author}`); }
     if (opts.after) { args.push(`--after=${opts.after}`); }
     if (opts.before) { args.push(`--before=${opts.before}`); }
     if (!opts.branch) { args.push('--all'); }
