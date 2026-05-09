@@ -32,17 +32,24 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  async function doAutoFetch() {
-    if (!autoFetchEnabled || isFetching) { return; }
+  async function fetchAllRepos(): Promise<boolean> {
+    if (isFetching) { return false; }
     const repos = gitService.getRepos();
-    if (repos.length === 0) { return; }
+    if (repos.length === 0) { return false; }
     isFetching = true;
     try {
       await Promise.all(repos.map(r => gitService.fetchAll(r.rootPath).catch(() => undefined)));
-      await statusBar.refresh();
-      logProvider.refresh();
+      return true;
     } finally {
       isFetching = false;
+    }
+  }
+
+  async function doAutoFetch() {
+    if (!autoFetchEnabled) { return; }
+    if (await fetchAllRepos()) {
+      await statusBar.refresh();
+      logProvider.refresh();
     }
   }
 
@@ -105,9 +112,16 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('ideaGit.openLog', () => {
       vscode.commands.executeCommand('ideaGit.logView.focus');
     }),
-    vscode.commands.registerCommand('ideaGit.refresh', () => {
+    vscode.commands.registerCommand('ideaGit.refresh', async () => {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Window, title: 'IDEA Git: Fetching...' },
+        async () => {
+          await fetchAllRepos();
+          await rescanRepos();
+        }
+      );
+      await statusBar.refresh();
       logProvider.refresh();
-      statusBar.refresh();
     }),
     vscode.commands.registerCommand('ideaGit.selectRepo', async () => {
       const repos = gitService.getRepos();
@@ -166,6 +180,8 @@ export async function activate(context: vscode.ExtensionContext) {
   refsWatcher.onDidDelete(() => { statusBar.refresh(); logProvider.refresh(); });
   context.subscriptions.push(refsWatcher);
 
+  setupBuiltinGitWatcher(context, statusBar, logProvider).catch(() => { /* ignore */ });
+
   vscode.workspace.onDidChangeWorkspaceFolders(() => { rescanRepos(); }, null, context.subscriptions);
 
   if (autoFetchEnabled) {
@@ -180,3 +196,42 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {}
+
+/**
+ * 借助 VS Code 内置 `vscode.git` 扩展感知 HEAD/分支变化，比 file system watcher
+ * 可靠（默认 watcherExclude 会忽略 .git 目录下的多数文件）。
+ */
+async function setupBuiltinGitWatcher(
+  context: vscode.ExtensionContext,
+  statusBar: StatusBarManager,
+  logProvider: LogViewProvider,
+): Promise<void> {
+  const ext = vscode.extensions.getExtension<any>('vscode.git');
+  if (!ext) { return; }
+  if (!ext.isActive) {
+    try { await ext.activate(); } catch { return; }
+  }
+  const api = ext.exports?.getAPI?.(1);
+  if (!api) { return; }
+  const seen = new WeakSet<object>();
+  const lastHead = new Map<string, string>();
+  const onRepoChange = (repo: any) => {
+    const head = repo.state?.HEAD;
+    const sig = `${head?.name || ''}@${head?.commit || ''}`;
+    const key = repo.rootUri?.fsPath || '';
+    if (lastHead.get(key) === sig) { return; }
+    lastHead.set(key, sig);
+    statusBar.refresh();
+    logProvider.refresh();
+  };
+  const subscribe = (repo: any) => {
+    if (!repo || seen.has(repo)) { return; }
+    seen.add(repo);
+    onRepoChange(repo);
+    const sub = repo.state?.onDidChange?.(() => onRepoChange(repo));
+    if (sub) { context.subscriptions.push(sub); }
+  };
+  for (const r of api.repositories || []) { subscribe(r); }
+  const opened = api.onDidOpenRepository?.((r: any) => subscribe(r));
+  if (opened) { context.subscriptions.push(opened); }
+}

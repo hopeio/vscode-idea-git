@@ -12,6 +12,8 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
   private currentRepo?: GitRepo;
   private currentLogFilters: { branch?: string; author?: string; after?: string; before?: string; path?: string } = {};
   private defaultBranchFilterAppliedRepo?: string;
+  /** 上次 refresh 观察到的当前分支，用于"filter 跟随 HEAD"判定 */
+  private lastObservedBranch?: string;
 
   constructor(private extensionUri: vscode.Uri, private gitService: GitService) {}
 
@@ -162,6 +164,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
           this.currentRepo = target;
           this.currentLogFilters = {};
           this.defaultBranchFilterAppliedRepo = undefined;
+          this.lastObservedBranch = undefined;
           vscode.commands.executeCommand('ideaGit.repoChanged', target);
           await this.refresh();
         }
@@ -637,16 +640,34 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       const [branches, currentBranch, tags] = await Promise.all([
         this.gitService.getBranches(repo), this.gitService.getCurrentBranch(repo), this.gitService.getTags(repo)
       ]);
-      const noFilters = !this.currentLogFilters.branch && !this.currentLogFilters.author && !this.currentLogFilters.after && !this.currentLogFilters.before && !this.currentLogFilters.path;
-      if (noFilters && this.defaultBranchFilterAppliedRepo !== repo && currentBranch && !currentBranch.startsWith('(')) {
-        this.currentLogFilters = { branch: currentBranch };
-        this.defaultBranchFilterAppliedRepo = repo;
-      }
+      this.maybeFollowHead(repo, currentBranch);
       const { opts, emptyMe } = await this.buildGetLogOpts(repo, this.currentLogFilters, 0, LogViewProvider.INITIAL_PAGE_SIZE);
       const commits = emptyMe ? [] : await this.gitService.getLog(repo, opts);
       const repos = this.gitService.getRepos();
       this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, repos, currentRepoPath: repo, activeFilters: this.currentLogFilters, append: false, hasMore: commits.length >= LogViewProvider.INITIAL_PAGE_SIZE });
     } catch (e: any) { vscode.window.showErrorMessage(`刷新失败: ${e.message}`); }
+  }
+
+  /**
+   * filter.branch 默认跟随当前 HEAD：
+   * - 首次进入仓库或没有任何 filter 时，把 branch filter 设为当前分支
+   * - 用户没主动改过 branch filter（filter.branch === 上次观察到的分支）时，
+   *   外部切分支自动同步到新分支；用户主动选了别的分支则保留其选择
+   */
+  private maybeFollowHead(repo: string, currentBranch: string): void {
+    const detached = !currentBranch || currentBranch.startsWith('(');
+    const noFilters = !this.currentLogFilters.branch && !this.currentLogFilters.author && !this.currentLogFilters.after && !this.currentLogFilters.before && !this.currentLogFilters.path;
+    if (noFilters && this.defaultBranchFilterAppliedRepo !== repo && !detached) {
+      this.currentLogFilters = { branch: currentBranch };
+      this.defaultBranchFilterAppliedRepo = repo;
+    } else if (
+      !detached &&
+      this.lastObservedBranch && this.lastObservedBranch !== currentBranch &&
+      this.currentLogFilters.branch === this.lastObservedBranch
+    ) {
+      this.currentLogFilters = { ...this.currentLogFilters, branch: currentBranch };
+    }
+    this.lastObservedBranch = currentBranch;
   }
 
   private getHtml(): string {
