@@ -1201,7 +1201,7 @@ function renderFiles(files,hash){
       for(const pd of mg.parentDiffs){
         h+='<div class="fp-group"><span>\\u25B6 Changes to '+eh(pd.abbrev)+' '+eh(pd.message.slice(0,50))+'</span><span class="cnt">'+pd.files.length+' files</span></div>';
         h+='<div class="fp-group-ch" style="display:none">';
-        h+=(filesViewMode==='tree'?buildFTree(pd.files,hash):buildFFlat(pd.files,hash));
+        h+=(filesViewMode==='tree'?buildFTree(pd.files,hash,pd.parentHash):buildFFlat(pd.files,hash,pd.parentHash));
         h+='</div>';
       }
     }
@@ -1246,26 +1246,30 @@ function renderFiles(files,hash){
   }else{det.classList.add('hidden');$('fpResize').classList.add('hidden');}
 }
 
-function buildFFlat(files,hash){
-  let h='';for(const f of files)h+='<div class="file-item" data-path="'+esc(f.path)+'" data-hash="'+hash+'">'+fileChangeIcons(f)+'<span title="'+esc(f.path)+'">'+eh(f.path)+'</span></div>';
+function fileItemAttrs(f,hash,fromHash){
+  const base='data-path="'+esc(f.path)+'" data-hash="'+hash+'"';
+  return fromHash?base+' data-from="'+esc(fromHash)+'" data-to="'+esc(hash)+'"':base;
+}
+function buildFFlat(files,hash,fromHash){
+  let h='';for(const f of files)h+='<div class="file-item" '+fileItemAttrs(f,hash,fromHash)+'>'+fileChangeIcons(f)+'<span title="'+esc(f.path)+'">'+eh(f.path)+'</span></div>';
   return h;
 }
-function buildFTree(files,hash){
+function buildFTree(files,hash,fromHash){
   const tree={};
   for(const f of files){const pts=f.path.split('/');let nd=tree;for(let i=0;i<pts.length-1;i++){const k='d_'+pts[i];if(!nd[k])nd[k]={};nd=nd[k];}nd['f_'+f.path]=f;}
-  return rFNode(tree,hash,0);
+  return rFNode(tree,hash,0,fromHash);
 }
-function rFNode(nd,hash,dep){
+function rFNode(nd,hash,dep,fromHash){
   let h='';const indent=6+dep*16;const dirs=[],leaves=[];
   for(const k of Object.keys(nd)){if(k.startsWith('f_'))leaves.push(nd[k]);else if(k.startsWith('d_'))dirs.push({key:k.slice(2),node:nd[k]});}
   dirs.sort((a,b)=>a.key.localeCompare(b.key));
   for(const d of dirs){
     const c=compactDirChain(d.key,d.node);
     h+='<div class="fdir'+(c.name.includes('/')?' compact':'')+'" style="padding-left:'+indent+'px"><span class="arr">\\u25BC</span><span class="dir-ico">\\u{1F4C2}</span><span class="path">'+eh(c.name)+'</span></div>';
-    h+='<div class="fdir-ch">';h+=rFNode(c.node,hash,dep+1);h+='</div>';
+    h+='<div class="fdir-ch">';h+=rFNode(c.node,hash,dep+1,fromHash);h+='</div>';
   }
   for(const f of leaves){const nm=f.path.split('/').pop();
-    h+='<div class="file-item" data-path="'+esc(f.path)+'" data-hash="'+hash+'" style="padding-left:'+(indent+16)+'px">'+fileChangeIcons(f)+'<span title="'+esc(f.path)+'">'+eh(nm)+'</span></div>';}
+    h+='<div class="file-item" '+fileItemAttrs(f,hash,fromHash)+' style="padding-left:'+(indent+16)+'px">'+fileChangeIcons(f)+'<span title="'+esc(f.path)+'">'+eh(nm)+'</span></div>';}
   return h;
 }
 function bindFI(c){c.querySelectorAll('.file-item').forEach(el=>{el.onclick=()=>{

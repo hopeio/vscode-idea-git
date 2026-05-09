@@ -3,6 +3,7 @@ node_modules/**
 src/**
 .gitignore
 tsconfig.json
-webpack.config.js
 **/*.map
 image.png
+*.vsix
+package-lock.json

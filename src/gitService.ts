@@ -348,20 +348,35 @@ export class GitService {
     await this.git(repoPath, ['revert', hash, '--no-edit']);
   }
 
-  async showFileDiff(repoPath: string, hash: string, filePath: string): Promise<void> {
+  /**
+   * 选 diff 左侧 parent：非 merge 直接用 parents[0]；merge 时按 parent 顺序找
+   * 第一个对该文件实际有差异的 parent，避免 parents[0]..merge 对该文件为空 diff。
+   */
+  private async pickDiffParentForFile(repoPath: string, hash: string, filePath: string): Promise<string> {
     const parents = await this.getCommitParents(repoPath, hash);
-    const parentHash = parents.length > 0 ? parents[0] : `${hash}~1`;
+    if (parents.length === 0) { return `${hash}~1`; }
+    if (parents.length === 1) { return parents[0]; }
+    for (const parent of parents) {
+      try {
+        const out = await this.git(repoPath, ['diff', '--name-only', parent, hash, '--', filePath]);
+        if (out.trim()) { return parent; }
+      } catch { /* ignore */ }
+    }
+    return parents[0];
+  }
+
+  async showFileDiff(repoPath: string, hash: string, filePath: string): Promise<void> {
+    const parentHash = await this.pickDiffParentForFile(repoPath, hash, filePath);
     const leftUri = vscode.Uri.parse(`idea-git-diff:${filePath}?repo=${encodeURIComponent(repoPath)}&hash=${parentHash}`);
     const rightUri = vscode.Uri.parse(`idea-git-diff:${filePath}?repo=${encodeURIComponent(repoPath)}&hash=${hash}`);
-    await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `${path.basename(filePath)} (${hash.slice(0, 7)})`);
+    await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `${path.basename(filePath)} (${parentHash.slice(0, 7)}..${hash.slice(0, 7)})`);
   }
 
   async showFileDiffInNewTab(repoPath: string, hash: string, filePath: string): Promise<void> {
-    const parents = await this.getCommitParents(repoPath, hash);
-    const parentHash = parents.length > 0 ? parents[0] : `${hash}~1`;
+    const parentHash = await this.pickDiffParentForFile(repoPath, hash, filePath);
     const leftUri = vscode.Uri.parse(`idea-git-diff:${filePath}?repo=${encodeURIComponent(repoPath)}&hash=${parentHash}`);
     const rightUri = vscode.Uri.parse(`idea-git-diff:${filePath}?repo=${encodeURIComponent(repoPath)}&hash=${hash}`);
-    await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `${path.basename(filePath)} (${hash.slice(0, 7)})`, { preview: false });
+    await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `${path.basename(filePath)} (${parentHash.slice(0, 7)}..${hash.slice(0, 7)})`, { preview: false });
   }
 
   async compareCommitFileWithLocal(repoPath: string, hash: string, filePath: string): Promise<void> {
@@ -371,8 +386,7 @@ export class GitService {
   }
 
   async compareBeforeFileWithLocal(repoPath: string, hash: string, filePath: string): Promise<void> {
-    const parents = await this.getCommitParents(repoPath, hash);
-    const before = parents.length > 0 ? parents[0] : `${hash}~1`;
+    const before = await this.pickDiffParentForFile(repoPath, hash, filePath);
     const leftUri = vscode.Uri.parse(`idea-git-diff:${filePath}?repo=${encodeURIComponent(repoPath)}&hash=${before}`);
     const rightUri = vscode.Uri.file(path.join(repoPath, filePath));
     await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `${path.basename(filePath)} (${before.slice(0, 7)} vs Local)`);
@@ -393,8 +407,7 @@ export class GitService {
   }
 
   async createFilePatch(repoPath: string, hash: string, filePath: string, outputPath: string): Promise<void> {
-    const parents = await this.getCommitParents(repoPath, hash);
-    const before = parents.length > 0 ? parents[0] : `${hash}~1`;
+    const before = await this.pickDiffParentForFile(repoPath, hash, filePath);
     const patch = await this.git(repoPath, ['diff', '--binary', before, hash, '--', filePath]);
     await fs.promises.writeFile(outputPath, patch);
   }
