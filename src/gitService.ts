@@ -465,12 +465,13 @@ export class GitService {
     terminal.show();
   }
 
-  async getFileHistory(repoPath: string, filePath: string, uptoHash: string): Promise<GitCommit[]> {
+  async getFileHistoryPage(repoPath: string, filePath: string, uptoHash: string, skip: number, limit: number): Promise<{ commits: GitCommit[]; hasMore: boolean }> {
     const SEP = '\x1e';
     const format = ['%H', '%h', '%an', '%aE', '%cn', '%cE', '%aI', '%at', '%s', '%P', '%D'].join(SEP);
-    const args = ['log', '--full-history', '--date-order', `--format=${format}`, '--decorate=short', uptoHash, '--', filePath];
+    const refArg = uptoHash ? uptoHash : '--all';
+    const args = ['log', '--full-history', `--format=${format}`, '--decorate=short', '-n', String(limit), '--skip', String(skip), refArg, '--', filePath];
     let out: string;
-    try { out = await this.git(repoPath, args); } catch { return []; }
+    try { out = await this.git(repoPath, args); } catch { return { commits: [], hasMore: false }; }
     const commits: GitCommit[] = [];
     for (const line of out.trim().split('\n')) {
       if (!line) { continue; }
@@ -483,7 +484,7 @@ export class GitService {
         parents: parts[9] ? parts[9].split(' ').filter(Boolean) : [], refs
       });
     }
-    return commits;
+    return { commits, hasMore: commits.length === limit };
   }
 
   async getFilePatchAtCommit(repoPath: string, hash: string, filePath: string): Promise<string> {

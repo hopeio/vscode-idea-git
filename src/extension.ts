@@ -156,7 +156,7 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
       const relPath = toGitPath(path.relative(repo.rootPath, target.fsPath));
-      await logProvider.openFileHistoryTabWithNativeDiff(repo.rootPath, relPath, 'HEAD');
+      await logProvider.openFileHistoryTabWithNativeDiff(repo.rootPath, relPath);
     }),
     vscode.commands.registerCommand('ideaGit.repoChanged', (repo) => {
       statusBar.setRepo(repo);

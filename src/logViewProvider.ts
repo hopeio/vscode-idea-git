@@ -6,6 +6,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'ideaGit.logView';
   private static readonly INITIAL_PAGE_SIZE = 80;
   private static readonly PAGE_SIZE = 200;
+  private static readonly FILE_HISTORY_PAGE_SIZE = 50;
   /** Webview filter pill + git log; sync embedded script FILTER_AUTHOR_ME */
   private static readonly filterAuthorMe = '__ideaGit_me__';
   private view?: vscode.WebviewView;
@@ -120,9 +121,16 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         vscode.window.showInformationMessage(`Patch saved to ${uri.fsPath}`);
         break;
       }
-      case 'fileHistory':
-        await this.openFileHistoryTabWithNativeDiff(repo, msg.filePath, msg.hash);
+      case 'fileHistory': {
+        let upto = typeof msg.uptoHash === 'string' ? msg.uptoHash : '';
+        let focus: string | undefined = typeof msg.focusHash === 'string' ? msg.focusHash : undefined;
+        if (typeof msg.hash === 'string' && msg.hash && !upto && typeof msg.focusHash !== 'string') {
+          upto = msg.hash;
+          focus = msg.hash;
+        }
+        await this.openFileHistoryTabWithNativeDiff(repo, msg.filePath, upto, focus);
         break;
+      }
       case 'unsupportedFileAction':
         vscode.window.showInformationMessage('该操作在当前版本按“文件级”暂不支持“选中部分变更”');
         break;
@@ -517,27 +525,62 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
 
   postMessage(msg: any) { this.view?.webview.postMessage(msg); }
 
-  async openFileHistoryTabWithNativeDiff(repo: string, filePath: string, uptoHash: string = 'HEAD') {
-    const commits = await this.gitService.getFileHistory(repo, filePath, uptoHash);
-    if (!commits.length) {
+  private static fileHistoryRowLite(c: GitCommit): { hash: string; abbrevHash: string; author: string; date: string; message: string } {
+    return { hash: c.hash, abbrevHash: c.abbrevHash, author: c.author, date: c.date, message: c.message };
+  }
+
+  /** 首屏 + 为定位 focusHash 必要时预取多页；nextSkip 为已消费的 git --skip 游标 */
+  private async loadFileHistoryInitialRows(repo: string, filePath: string, uptoHash: string, focusHash: string | undefined): Promise<{
+    rows: ReturnType<typeof LogViewProvider.fileHistoryRowLite>[]; nextSkip: number; hasMore: boolean;
+  }> {
+    const PAGE = LogViewProvider.FILE_HISTORY_PAGE_SIZE;
+    const dedupe = (arr: GitCommit[]) => {
+      const s = new Set<string>();
+      return arr.filter((c) => (s.has(c.hash) ? false : (s.add(c.hash), true)));
+    };
+    let rawSkip = 0;
+    let merged: GitCommit[] = [];
+    let hasMore = true;
+    const pull = async () => {
+      const p = await this.gitService.getFileHistoryPage(repo, filePath, uptoHash, rawSkip, PAGE);
+      rawSkip += p.commits.length;
+      hasMore = p.hasMore;
+      merged = dedupe([...merged, ...p.commits]);
+    };
+    await pull();
+    if (focusHash && !merged.some((c) => c.hash === focusHash) && hasMore) {
+      for (let i = 0; i < 4 && hasMore && !merged.some((c) => c.hash === focusHash); i++) {
+        await pull();
+      }
+    }
+    return { rows: merged.map(LogViewProvider.fileHistoryRowLite), nextSkip: rawSkip, hasMore };
+  }
+
+  async openFileHistoryTabWithNativeDiff(repo: string, filePath: string, uptoHash: string = '', focusHash?: string) {
+    const init = await this.loadFileHistoryInitialRows(repo, filePath, uptoHash, focusHash);
+    if (!init.rows.length) {
       vscode.window.showInformationMessage('该文件暂无提交历史');
       return;
     }
+    const initialHash = (focusHash && init.rows.some((r) => r.hash === focusHash)) ? focusHash : init.rows[0].hash;
+    const firstPatch = await this.gitService.getFilePatchAtCommit(repo, initialHash, filePath);
     const panel = vscode.window.createWebviewPanel(
       'ideaGit.fileHistory.nativeDiff',
       `File History: ${path.basename(filePath)}`,
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true }
     );
-    const firstHash = commits[0].hash;
-    const firstPatch = await this.gitService.getFilePatchAtCommit(repo, firstHash, filePath);
-    const items = JSON.stringify(commits.map(c => ({
-      hash: c.hash, abbrevHash: c.abbrevHash, author: c.author, date: c.date, message: c.message
-    })));
+    let nextSkip = init.nextSkip;
+    let hasMore = init.hasMore;
+    let loadMoreInFlight = false;
+    const items = JSON.stringify(init.rows);
     panel.webview.html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
       body{margin:0;padding:0;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);font-family:var(--vscode-font-family);font-size:12px}
-      .wrap{display:flex;height:100vh}.left{width:320px;border-right:1px solid var(--vscode-panel-border);overflow:auto}
-      .right{flex:1;overflow:auto;padding:0}
+      .wrap{display:flex;height:100vh;min-height:0}
+      .leftCol{width:320px;border-right:1px solid var(--vscode-panel-border);display:flex;flex-direction:column;min-height:0;min-width:0}
+      #left{flex:1;overflow:auto;min-height:0}
+      #histFoot{flex-shrink:0;padding:4px 8px;font-size:11px;color:var(--vscode-descriptionForeground);border-top:1px solid var(--vscode-panel-border)}
+      .right{flex:1;overflow:auto;padding:0;min-width:0}
       .item{padding:6px 10px;border-bottom:1px solid var(--vscode-panel-border);cursor:pointer}
       .item:hover{background:var(--vscode-list-hoverBackground)}.item.sel{background:var(--vscode-list-activeSelectionBackground);color:var(--vscode-list-activeSelectionForeground)}
       .m1{display:flex;align-items:center;gap:8px}
@@ -552,15 +595,17 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       .l{display:block}.l.h{color:#6ea8fe}.l.a{color:#3fb950;background:#2ea0431f}.l.d{color:#ff7b72;background:#f851491f}.l.m{color:#d2a8ff}
       .l.c{color:#8b949e}.ctx{display:block;color:#79c0ff;cursor:pointer;background:#1f6feb22;padding:1px 6px;margin:1px 0;border-radius:4px}
       .ctx:hover{background:#1f6feb44}
-    </style></head><body><div class="wrap"><div class="left" id="left"></div><div class="right"><div class="ph"><span class="b add" id="addCnt">+0</span><span class="b del" id="delCnt">-0</span><span class="hint">点击左侧小图标打开原生 Diff</span></div><div id="patch"></div></div></div>
+    </style></head><body><div class="wrap"><div class="leftCol"><div id="left"></div><div id="histFoot"></div></div><div class="right"><div class="ph"><span class="b add" id="addCnt">+0</span><span class="b del" id="delCnt">-0</span><span class="hint">点击左侧小图标打开原生 Diff</span></div><div id="patch"></div></div></div>
       <script>
-        const vscode=acquireVsCodeApi();const commits=${items};const left=document.getElementById('left');
+        const vscode=acquireVsCodeApi();let commits=${items};let hasMore=${JSON.stringify(init.hasMore)};let loadingMore=false;let currentSel=${JSON.stringify(initialHash)};
+        const left=document.getElementById('left');const histFoot=document.getElementById('histFoot');
         function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-        function render(sel){
-          left.innerHTML=commits.map(c=>'<div class="item'+(c.hash===sel?' sel':'')+'" data-h="'+c.hash+'"><div class="m1"><span class="m1t">'+esc(c.message||'')+'</span><span class="native" data-nh="'+c.hash+'" title="打开 VS Code 原生 Diff">⧉</span></div><div class="m2">'+esc(c.abbrevHash)+'  '+esc(c.author||'')+'  '+esc((c.date||'').replace('T',' ').slice(0,16))+'</div></div>').join('');
-          left.querySelectorAll('.item').forEach(el=>el.onclick=()=>{const h=el.getAttribute('data-h');render(h);vscode.postMessage({type:'selectHistoryCommitPatch',hash:h});});
-          left.querySelectorAll('.native').forEach(el=>el.onclick=e=>{e.stopPropagation();const h=el.getAttribute('data-nh');vscode.postMessage({type:'openHistoryCommitNativeDiff',hash:h});});
-        }
+        function rowHtml(c){return '<div class="item'+(c.hash===currentSel?' sel':'')+'" data-h="'+c.hash+'"><div class="m1"><span class="m1t">'+esc(c.message||'')+'</span><span class="native" data-nh="'+c.hash+'" title="打开 VS Code 原生 Diff">⧉</span></div><div class="m2">'+esc(c.abbrevHash)+'  '+esc(c.author||'')+'  '+esc((c.date||'').replace('T',' ').slice(0,16))+'</div></div>';}
+        function setSel(h){currentSel=h;left.querySelectorAll('.item').forEach(el=>el.classList.toggle('sel',el.getAttribute('data-h')===h));}
+        function updateFoot(){if(!histFoot)return;histFoot.textContent=hasMore?'向下滚动加载更多':'已全部加载';}
+        function scrollSel(){requestAnimationFrame(()=>{const el=left.querySelector('.item.sel');if(el)el.scrollIntoView({block:'nearest'});});}
+        function bindScroll(){left.onscroll=()=>{if(!hasMore||loadingMore)return;if(left.scrollTop+left.clientHeight>=left.scrollHeight-100){loadingMore=true;if(histFoot)histFoot.textContent='加载中…';vscode.postMessage({type:'fileHistoryLoadMore'});}};}
+        left.addEventListener('click',(e)=>{const nat=e.target.closest('.native');const item=e.target.closest('.item');if(nat){e.stopPropagation();vscode.postMessage({type:'openHistoryCommitNativeDiff',hash:nat.getAttribute('data-nh')});return;}if(item){const h=item.getAttribute('data-h');setSel(h);vscode.postMessage({type:'selectHistoryCommitPatch',hash:h});}});
         const ctxOpen=new Set();
         function renderPatch(p){const lines=(p||'').split('\\n');let add=0,del=0,html='';let i=0,b=0;
           while(i<lines.length){const ln=lines[i];
@@ -583,24 +628,42 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
           const pEl=document.getElementById('patch');pEl.innerHTML=html;document.getElementById('addCnt').textContent='+'+add;document.getElementById('delCnt').textContent='-'+del;
           pEl.querySelectorAll('.ctx').forEach(el=>{el.onclick=()=>{ctxOpen.add(Number(el.dataset.b));renderPatch(p);};});
         }
-        render('${firstHash}');
+        left.innerHTML=commits.map(rowHtml).join('');
         renderPatch(${JSON.stringify(firstPatch)});
-        window.addEventListener('message',e=>{const m=e.data;if(m.type==='historyPatch'){renderPatch(m.patch||'');render(m.hash||'');}});
+        function tryAutoLoadMore(){if(!hasMore||loadingMore)return;if(left.scrollHeight<=left.clientHeight+8){loadingMore=true;if(histFoot)histFoot.textContent='加载中…';vscode.postMessage({type:'fileHistoryLoadMore'});}}
+        bindScroll();updateFoot();scrollSel();requestAnimationFrame(()=>requestAnimationFrame(tryAutoLoadMore));
+        window.addEventListener('message',e=>{const m=e.data;if(m.type==='historyCommitsAppend'){const seen=new Set(commits.map(x=>x.hash));for(const c of(m.commits||[])){if(seen.has(c.hash))continue;seen.add(c.hash);commits.push(c);left.insertAdjacentHTML('beforeend',rowHtml(c));}hasMore=!!m.hasMore;loadingMore=false;updateFoot();tryAutoLoadMore();return;}if(m.type==='historyPatch'){renderPatch(m.patch||'');setSel(m.hash||currentSel);scrollSel();}});
       </script></body></html>`;
     panel.webview.onDidReceiveMessage(async (msg) => {
-      if (!msg.hash) { return; }
+      if (msg.type === 'fileHistoryLoadMore') {
+        if (loadMoreInFlight || !hasMore) { return; }
+        loadMoreInFlight = true;
+        try {
+          const page = await this.gitService.getFileHistoryPage(repo, filePath, uptoHash, nextSkip, LogViewProvider.FILE_HISTORY_PAGE_SIZE);
+          nextSkip += page.commits.length;
+          hasMore = page.hasMore;
+          panel.webview.postMessage({ type: 'historyCommitsAppend', commits: page.commits.map(LogViewProvider.fileHistoryRowLite), hasMore });
+        } catch {
+          panel.webview.postMessage({ type: 'historyCommitsAppend', commits: [], hasMore: false });
+        } finally {
+          loadMoreInFlight = false;
+        }
+        return;
+      }
       if (msg.type === 'openHistoryCommitNativeDiff') {
+        if (!msg.hash) { return; }
         await this.gitService.showFileDiffInNewTab(repo, msg.hash, filePath);
         return;
       }
-      if (msg.type !== 'selectHistoryCommitPatch') { return; }
+      if (msg.type !== 'selectHistoryCommitPatch' || !msg.hash) { return; }
       const patch = await this.gitService.getFilePatchAtCommit(repo, msg.hash, filePath);
       panel.webview.postMessage({ type: 'historyPatch', hash: msg.hash, patch });
     });
   }
 
   private async openFileHistoryPanel(repo: string, filePath: string, uptoHash: string) {
-    const commits = await this.gitService.getFileHistory(repo, filePath, uptoHash);
+    const page = await this.gitService.getFileHistoryPage(repo, filePath, uptoHash, 0, 200);
+    const commits = page.commits;
     const panel = vscode.window.createWebviewPanel(
       'ideaGit.fileHistory',
       `History Up to Here: ${path.basename(filePath)}`,
@@ -1467,7 +1530,7 @@ function fileCtx(e,el){
   showCtx(e.clientX,e.clientY,[
     {icon:'\\u21A9',label:'Revert Selected Changes',action:()=>vscode.postMessage({type:'revertFileToHead',filePath:fp})},
     {icon:'\\u{1F352}',label:'Cherry-Pick Selected Changes',action:()=>vscode.postMessage({type:'checkoutFileFromRevision',hash:h,filePath:fp})},
-    {icon:'\\u{1F553}',label:'History Up to Here',action:()=>vscode.postMessage({type:'fileHistory',hash:h,filePath:fp})}
+    {icon:'\\u{1F553}',label:'Show History',action:()=>vscode.postMessage({type:'fileHistory',filePath:fp,focusHash:h})}
   ]);
 }
 
