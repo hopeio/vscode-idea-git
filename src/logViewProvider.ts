@@ -16,6 +16,9 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
   /** 上次 refresh 观察到的当前分支，用于"filter 跟随 HEAD"判定 */
   private lastObservedBranch?: string;
 
+  /** 与 loadLog 竞态：refresh 后丢弃过期的 loadLog 响应，避免旧 logData 覆盖新 tags/commits。 */
+  private logStaleSeq = 0;
+
   constructor(private extensionUri: vscode.Uri, private gitService: GitService) {}
 
   private async buildGetLogOpts(repo: string, filters: { branch?: string; author?: string; after?: string; before?: string; path?: string }, skip: number, maxCount: number) {
@@ -53,6 +56,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
     switch (msg.type) {
       case 'ready': await this.refresh(); break;
       case 'loadLog': {
+        const seqAtStart = this.logStaleSeq;
         const filters = msg.filters || {};
         this.currentLogFilters = filters;
         const skip = Number(msg.skip || 0);
@@ -63,6 +67,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         const branches = await this.gitService.getBranches(repo);
         const currentBranch = await this.gitService.getCurrentBranch(repo);
         const tags = await this.gitService.getTags(repo);
+        if (seqAtStart !== this.logStaleSeq) { return; }
         this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, append: !!msg.append, hasMore: commits.length >= maxCount, reqId: msg.reqId });
         break;
       }
@@ -161,6 +166,10 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
           vscode.commands.executeCommand('ideaGit.repoChanged', target);
           await this.refresh();
         }
+        break;
+      }
+      case 'refreshRepos': {
+        await vscode.commands.executeCommand('ideaGit.refresh');
         break;
       }
       case 'newBranchFrom': {
@@ -419,6 +428,30 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         await this.refresh();
         break;
       }
+      case 'deleteTag': {
+        const taggedHash = await this.gitService.resolveTagCommit(repo, msg.tag);
+        try {
+          await this.gitService.deleteTag(repo, msg.tag);
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`删除 Tag 失败: ${e.message}`);
+          break;
+        }
+        vscode.window.showInformationMessage(`已删除本地 Tag: ${msg.tag}`);
+        void this.refresh();
+        if (taggedHash) { void this.refreshCommitDetail(repo, taggedHash); }
+        void vscode.window.showWarningMessage(
+          `是否同时删除远端 Tag "${msg.tag}"？`, '删除远端', '保留远端'
+        ).then(async pick => {
+          if (pick !== '删除远端') { return; }
+          try {
+            await this.gitService.deleteRemoteTag(repo, msg.tag);
+            vscode.window.showInformationMessage(`已删除远端 Tag: ${msg.tag}`);
+          } catch (e: any) {
+            vscode.window.showErrorMessage(`删除远端 Tag 失败: ${e.message}`);
+          }
+        });
+        break;
+      }
       case 'createPatch': {
         const uri = await vscode.window.showSaveDialog({ defaultUri: vscode.Uri.file(`${msg.hash.slice(0, 7)}.patch`), filters: { 'Patch': ['patch'] } });
         if (!uri) { break; }
@@ -448,12 +481,25 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         break;
       }
       case 'newTag': {
-        const name = await vscode.window.showInputBox({ prompt: `在 ${msg.hash.slice(0, 7)} 创建 Tag`, placeHolder: 'v1.0.0' });
+        const input = await vscode.window.showInputBox({
+          prompt: `在 ${msg.hash.slice(0, 7)} 创建 Tag（可用 "name | message" 创建 annotated tag）`,
+          placeHolder: 'v1.0.0',
+          validateInput: v => (v && v.trim() ? null : '请输入 tag 名'),
+        });
+        if (!input) { break; }
+        const sepIdx = input.indexOf('|');
+        const name = (sepIdx >= 0 ? input.slice(0, sepIdx) : input).trim();
+        const tagMsg = sepIdx >= 0 ? input.slice(sepIdx + 1).trim() : '';
         if (!name) { break; }
-        const tagMsg = await vscode.window.showInputBox({ prompt: 'Tag 信息（留空为 lightweight tag）', placeHolder: '' });
-        await this.gitService.createTag(repo, name, msg.hash, tagMsg || undefined);
-        vscode.window.showInformationMessage(`已创建 Tag: ${name}`);
-        await this.refresh();
+        try {
+          await this.gitService.createTag(repo, name, msg.hash, tagMsg || undefined);
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`创建 Tag 失败: ${e?.message || e}`);
+          break;
+        }
+        vscode.window.showInformationMessage(`已创建 Tag: ${name}${tagMsg ? '（annotated）' : ''}`);
+        void this.refresh();
+        void this.refreshCommitDetail(repo, msg.hash);
         break;
       }
       case 'fixup': {
@@ -834,6 +880,8 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
 
   async refresh() {
     if (!this.view || !this.currentRepo) { return; }
+    this.logStaleSeq++;
+    const mySeq = this.logStaleSeq;
     try {
       const repo = this.currentRepo.rootPath;
       const [branches, currentBranch, tags] = await Promise.all([
@@ -842,9 +890,32 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       this.maybeFollowHead(repo, currentBranch);
       const { opts, emptyMe } = await this.buildGetLogOpts(repo, this.currentLogFilters, 0, LogViewProvider.INITIAL_PAGE_SIZE);
       const commits = emptyMe ? [] : await this.gitService.getLog(repo, opts);
-      const repos = this.gitService.getRepos();
+      const repos = await this.buildReposWithUpdateFlags();
+      if (mySeq !== this.logStaleSeq) { return; }
       this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, repos, currentRepoPath: repo, activeFilters: this.currentLogFilters, append: false, hasMore: commits.length >= LogViewProvider.INITIAL_PAGE_SIZE });
     } catch (e: any) { vscode.window.showErrorMessage(`刷新失败: ${e.message}`); }
+  }
+
+  /** 改变某 commit 的 refs/标签后，重新拉取 changed 面板的 detail/files 并发送到 webview。 */
+  private async refreshCommitDetail(repo: string, hash: string): Promise<void> {
+    if (!hash) { return; }
+    const oid = await this.gitService.resolveCommitOid(repo, hash);
+    try {
+      const [files, detail, mergeGroups] = await Promise.all([
+        this.gitService.getCommitFiles(repo, oid),
+        this.gitService.getCommitDetail(repo, oid),
+        this.gitService.getMergeFileGroups(repo, oid),
+      ]);
+      this.postMessage({ type: 'commitFiles', hash: oid, files, detail, mergeGroups });
+    } catch (e: any) {
+      vscode.window.showErrorMessage(`同步提交详情失败: ${e?.message || e}`);
+    }
+  }
+
+  private async buildReposWithUpdateFlags(): Promise<Array<GitRepo & { hasRemoteUpdates: boolean }>> {
+    const repos = this.gitService.getRepos();
+    const flags = await Promise.all(repos.map(r => this.gitService.repoHasRemoteUpdates(r.rootPath).catch(() => false)));
+    return repos.map((r, i) => ({ ...r, hasRemoteUpdates: flags[i] }));
   }
 
   /**
@@ -880,7 +951,7 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size,13px
 .root{display:flex;flex-direction:column;height:100vh}
 .toolbar{display:flex;align-items:center;gap:8px;padding:4px 10px;border-bottom:1px solid var(--border);flex-shrink:0;overflow-x:auto}
 .tb-search{position:relative;flex-shrink:0}
-.tb-search input{background:var(--input-bg);color:var(--input-fg);border:1px solid var(--input-border);padding:3px 6px;border-radius:3px;font-size:12px;width:120px}
+.tb-search input{background:var(--input-bg);color:var(--input-fg);border:1px solid var(--input-border);padding:3px 6px;border-radius:3px;font-size:12px;width:90px}
 .tb-search input:focus{border-color:var(--vscode-focusBorder,#007fd4)}
 .tb-dd{position:absolute;top:100%;left:0;right:0;background:var(--vscode-menu-background,#252526);border:1px solid var(--border);border-radius:0 0 4px 4px;max-height:200px;overflow-y:auto;z-index:100;display:none}
 .tb-dd.show{display:block}
@@ -893,15 +964,22 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size,13px
 .pill .x:hover{opacity:1}
 .tb-sep{width:1px;height:20px;background:var(--border);flex-shrink:0;margin:0 2px}
 .tb-select{background:var(--input-bg);color:var(--input-fg);border:1px solid var(--input-border);padding:2px 4px;border-radius:3px;font-size:11px;max-width:130px}
+.tb-select.has-updates{border-color:#f0883e;color:#f0883e;box-shadow:0 0 0 1px #f0883e60 inset}
+.repo-update-badge{display:none;align-items:center;justify-content:center;gap:2px;min-width:20px;min-height:20px;padding:2px 7px;margin-right:4px;border-radius:10px;background:#f0883e;color:#1f1f1f;font-size:11px;font-weight:700;cursor:pointer;user-select:none;line-height:1;flex-shrink:0;white-space:nowrap;font-variant-numeric:tabular-nums}
+.repo-update-badge.show{display:inline-flex}
+.repo-update-badge:hover{filter:brightness(1.1)}
 .date-picker{position:fixed;display:flex;align-items:center;gap:6px;background:var(--vscode-menu-background,#252526);border:1px solid var(--border);border-radius:4px;padding:8px 10px;z-index:100;box-shadow:0 4px 12px rgba(0,0,0,.4)}
 .date-picker input{background:var(--input-bg);color:var(--input-fg);border:1px solid var(--input-border);padding:3px 6px;border-radius:3px;font-size:12px}
 .date-picker button{background:var(--badge);color:var(--badge-fg);border:none;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:12px}
 .main{display:flex;flex:1;overflow:hidden}
-.branch-panel{width:200px;min-width:140px;border-right:1px solid var(--border);flex-shrink:0;display:flex;flex-direction:column}
-.bp-toolbar{display:flex;align-items:center;padding:4px 6px;gap:4px;border-bottom:1px solid var(--border);flex-shrink:0}
-.toggle-btn{background:none;border:1px solid var(--input-border);color:var(--fg);padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px;line-height:16px}
+.branch-panel{width:200px;min-width:140px;border-right:1px solid var(--border);flex-shrink:0;height:100%;overflow-y:auto;overflow-x:hidden;position:relative}
+.bp-pinned{position:sticky;top:0;z-index:5;background:var(--bg);box-shadow:0 1px 4px rgba(0,0,0,.3)}
+.bp-toolbar{display:flex;align-items:center;padding:4px 6px;gap:3px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.toggle-btn{background:none;border:1px solid var(--input-border);color:var(--fg);padding:2px 6px;border-radius:3px;cursor:pointer;font-size:11px;line-height:16px;white-space:nowrap}
 .toggle-btn.active{background:var(--badge);color:var(--badge-fg);border-color:var(--badge)}
-.bp-content{flex:1;overflow-y:auto}
+.bp-content{}
+.bp-head{background:var(--bg);border-bottom:1px solid var(--border)}
+.bp-head .branch-item{padding:5px 10px;font-weight:600}
 .sec-hd{padding:6px 10px;font-weight:600;font-size:11px;text-transform:uppercase;color:var(--desc);cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px}
 .sec-hd:hover{background:var(--hover)}
 .sec-hd .arr{display:inline-block;width:10px;font-size:10px}
@@ -979,6 +1057,7 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size,13px
 <div class="root">
   <div class="toolbar" id="toolbar">
     <select class="tb-select" id="repoSelect" title="选择仓库" style="display:none"></select>
+    <span id="repoUpdateBadge" class="repo-update-badge" title="点击执行 Refresh（fetch + 刷新）"></span>
     <div class="tb-search">
       <input id="branchInput" placeholder="Branch or tag" autocomplete="off">
       <div class="tb-dd" id="branchDD"></div>
@@ -999,10 +1078,14 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size,13px
   </div>
   <div class="main">
     <div class="branch-panel" id="branchPanel">
-      <div class="bp-toolbar">
-        <button class="toggle-btn active" id="bpTree" title="Tree view">Tree</button>
-        <button class="toggle-btn" id="bpFlat" title="Flat view">Flat</button>
-        <button class="toggle-btn" id="bpCollapse" title="Collapse all">Collapse</button>
+      <div class="bp-pinned">
+        <div class="bp-toolbar">
+          <button class="toggle-btn active" id="bpTree" title="Tree view">Tree</button>
+          <button class="toggle-btn" id="bpFlat" title="Flat view">Flat</button>
+          <button class="toggle-btn" id="bpCollapse" title="Collapse all">Fold</button>
+          <button class="toggle-btn" id="bpJumpHead" title="Jump to HEAD">Head</button>
+        </div>
+        <div class="bp-head" id="bpHead"></div>
       </div>
       <div class="bp-content" id="bpContent"></div>
     </div>
@@ -1045,6 +1128,12 @@ let selectedHashes=new Set(),lastClickedIdx=-1;
 let branchViewMode='tree', filesViewMode='tree';
 let currentFilesHash=null, currentFiles=[], currentDetail=null, currentMergeGroups=null;
 const branchTreeOpen=new Set();
+let branchClickTimer=null;
+let lastBranchSig='';
+function branchPanelSig(){
+  const bs=(allBranches||[]).map(b=>b.name+'#'+(b.remote?'r':'l')+'#'+(b.tracking||'')+'#'+(b.behind||0)+'/'+(b.ahead||0)).join('|');
+  return currentBranch+'\\u0001'+bs+'\\u0001'+(allTags||[]).join('|');
+}
 const LOG_INITIAL_PAGE_SIZE=80;
 const LOG_PAGE_SIZE=200;
 let logHasMore=true,logLoadingMore=false,currentLoadFilters={};
@@ -1072,13 +1161,18 @@ window.addEventListener('message',e=>{
     }else{
       allCommits=incoming;
     }
-    allBranches=m.branches||allBranches;allTags=m.tags||allTags;currentBranch=m.currentBranch||currentBranch;
+    allBranches=Array.isArray(m.branches)?m.branches:allBranches;allTags=Array.isArray(m.tags)?m.tags:allTags;currentBranch=m.currentBranch||currentBranch;
     logHasMore=typeof m.hasMore==='boolean'?m.hasMore:(incoming.length>=LOG_PAGE_SIZE);
     logLoadingMore=false;
     if(m.repos)renderRepoSelect(m.repos,m.currentRepoPath);
-    renderBranches();renderBranchFilter();renderAuthorList();renderFilterBar();renderLog(allCommits);
+    const _sig=branchPanelSig();
+    if(_sig!==lastBranchSig){lastBranchSig=_sig;renderBranches();}
+    renderBranchFilter();renderAuthorList();renderFilterBar();renderLog(allCommits);
+    if(filters.branch)highlightBranch(filters.branch);
   }else if(m.type==='commitFiles'){
-    currentFilesHash=m.hash;currentFiles=m.files||[];currentDetail=m.detail||null;currentMergeGroups=m.mergeGroups||null;renderFiles(currentFiles,m.hash);
+    currentFilesHash=m.hash;currentFiles=m.files||[];currentDetail=m.detail||null;currentMergeGroups=m.mergeGroups||null;
+    if(m.hash&&selectedHashes.size===1){selectedHashes.clear();selectedHashes.add(m.hash);renderLog(allCommits);}
+    renderFiles(currentFiles,m.hash);
   }else if(m.type==='compareFiles'){
     renderCompareFiles(m.from,m.to,m.files||[],m.fromLabel||m.from,m.toLabel||m.to,m.diffMode||'');
   }else if(m.type==='branchSwitched'){
@@ -1094,9 +1188,32 @@ window.addEventListener('message',e=>{
 /* ===== Repo ===== */
 function renderRepoSelect(repos,cur){
   const s=$('repoSelect');
-  if(repos.length<=1){s.style.display='none';return;}
-  s.style.display='';s.innerHTML=repos.map(r=>'<option value="'+esc(r.rootPath)+'"'+(r.rootPath===cur?' selected':'')+'>'+eh(r.name)+'</option>').join('');
+  const badge=$('repoUpdateBadge');
+  const updatedRepos=(repos||[]).filter(r=>r&&r.hasRemoteUpdates);
+  const curHasUpdates=!!updatedRepos.find(r=>r.rootPath===cur);
+  const otherUpdated=updatedRepos.filter(r=>r.rootPath!==cur);
+  if(badge){
+    if(curHasUpdates||otherUpdated.length){
+      badge.classList.add('show');
+      const lines=[];
+      if(curHasUpdates)lines.push('当前仓库远端有未拉取的更新');
+      if(otherUpdated.length)lines.push('以下仓库远端有更新：\\n  '+otherUpdated.map(r=>r.name).join('\\n  '));
+      badge.title=lines.join('\\n')+'\\n\\n点击执行 Refresh（fetch + 刷新）';
+      badge.textContent=updatedRepos.length>1?String(updatedRepos.length):'!';
+    }else{
+      badge.classList.remove('show');
+    }
+  }
+  if(repos&&repos.length<=1){s.style.display='none';return;}
+  s.style.display='';
+  s.classList.toggle('has-updates',curHasUpdates);
+  s.title=updatedRepos.length?'有仓库远端有未拉取的更新':'';
+  s.innerHTML=repos.map(r=>{
+    const mark=r.hasRemoteUpdates?'* ':'';
+    return '<option value="'+esc(r.rootPath)+'"'+(r.rootPath===cur?' selected':'')+' title="'+esc(r.rootPath)+(r.hasRemoteUpdates?' （远端有更新）':'')+'">'+mark+eh(r.name)+'</option>';
+  }).join('');
 }
+$('repoUpdateBadge').onclick=()=>{vscode.postMessage({type:'refreshRepos'});};
 $('repoSelect').onchange=e=>{
   filters.branch='';filters.author='';filters.after='';filters.before='';filters.path='';
   $('branchInput').value='';$('searchInput').value='';$('pathInput').value='';
@@ -1110,6 +1227,22 @@ $('bpTree').onclick=()=>{branchViewMode='tree';$('bpTree').classList.add('active
 $('bpFlat').onclick=()=>{branchViewMode='flat';$('bpFlat').classList.add('active');$('bpTree').classList.remove('active');renderBranches();};
 $('bpCollapse').onclick=()=>{branchTreeOpen.clear();if(branchViewMode==='tree')renderBranches();};
 
+function scrollPanelTop(){
+  const reset=()=>{['branchPanel','bpContent','logScroll'].forEach(id=>{const el=$(id);if(el){el.scrollTop=0;el.scrollLeft=0;}});};
+  reset();
+  requestAnimationFrame(()=>{reset();requestAnimationFrame(reset);});
+  setTimeout(reset,80);
+  setTimeout(reset,300);
+}
+
+$('bpJumpHead').onclick=()=>{
+  if(!currentBranch)return;
+  filters.branch=currentBranch;
+  applyF();
+  highlightBranch(currentBranch);
+  scrollPanelTop();
+};
+
 function renderBranches(){
   const p=$('bpContent'),lo=allBranches.filter(b=>!b.remote),rm=allBranches.filter(b=>b.remote);
   const remotes=new Set();
@@ -1122,8 +1255,10 @@ function renderBranches(){
   });
   let h='';
   ensureCurrentBranchPathExpanded(lo,rmDisplay);
-  if(currentBranch){
-    h+='<div class="branch-item cur" data-branch="'+esc(currentBranch)+'" style="padding:5px 10px;font-weight:600">\\u2605 HEAD ('+eh(currentBranch)+')</div>';
+  const headEl=$('bpHead');
+  if(headEl){
+    headEl.innerHTML=currentBranch?('<div class="branch-item cur" data-branch="'+esc(currentBranch)+'" title="点击：回到顶部并切到 HEAD 分支">\\u2605 HEAD ('+eh(currentBranch)+')</div>'):'';
+    headEl.querySelectorAll('.branch-item').forEach(el=>{bindBI(el);el.addEventListener('click',scrollPanelTop);});
   }
   h+=secHd('Local');
   h+='<div class="sec-body">';
@@ -1142,7 +1277,7 @@ function renderBranches(){
       const tagBranches=allTags.map(t=>({name:t,remote:false,current:false}));
       h+=buildBTree(tagBranches,true);
     }else{
-      for(const t of allTags)h+='<div class="branch-item tag-item" data-branch="'+esc(t)+'" style="padding-left:20px"><span class="bi">\\u{1F3F7}</span>'+eh(t)+'</div>';
+      for(const t of allTags)h+='<div class="branch-item tag-item" data-branch="'+esc(t)+'" data-istag="1" style="padding-left:20px"><span class="bi">\\u{1F3F7}</span>'+eh(t)+'</div>';
     }
   }else{
     h+='<div style="padding:4px 20px;color:var(--desc);font-size:11px">No tags</div>';
@@ -1228,21 +1363,27 @@ function bLeaf(b,indent){
   const display=(b.displayName||b.name);
   const lbl=branchViewMode==='tree'?display.split('/').pop():display;
   let sync='';
-  if(!b.remote){
-    if((b.behind||0)>0)sync+='<span title="Need pull">\\u2199 '+b.behind+'</span>';
-    if((b.ahead||0)>0)sync+='<span title="Need push">\\u2197 '+b.ahead+'</span>';
+  if(!b.remote&&!b.isTag){
+    if((b.behind||0)>0)sync+='<span title="Need pull">\\u2193 '+b.behind+'</span>';
+    if((b.ahead||0)>0)sync+='<span title="Need push">\\u2191 '+b.ahead+'</span>';
   }
-  return '<div class="branch-item'+c+'" data-branch="'+esc(b.name)+'"'+(b.tracking?' data-tracking="'+esc(b.tracking)+'"':'')+' style="padding-left:'+indent+'px"><span class="bi">'+ico+'</span><span class="blabel">'+eh(lbl)+'</span>'+(sync?'<span class="bsync">'+sync+'</span>':'')+'</div>';
+  const tagAttr=b.isTag?' data-istag="1"':'';
+  const cls=b.isTag?' tag-item':'';
+  return '<div class="branch-item'+c+cls+'" data-branch="'+esc(b.name)+'"'+(b.tracking?' data-tracking="'+esc(b.tracking)+'"':'')+tagAttr+' style="padding-left:'+indent+'px"><span class="bi">'+ico+'</span><span class="blabel">'+eh(lbl)+'</span>'+(sync?'<span class="bsync">'+sync+'</span>':'')+'</div>';
 }
 
 function bindBI(el){
   el.onclick=(e)=>{
     if(e.detail>=2)return;
-    filters.branch=el.dataset.branch;applyF();highlightBranch(el.dataset.branch);
+    if(branchClickTimer){clearTimeout(branchClickTimer);branchClickTimer=null;}
+    const br=el.dataset.branch;
+    branchClickTimer=setTimeout(()=>{branchClickTimer=null;filters.branch=br;applyF();highlightBranch(br);},280);
   };
   el.ondblclick=(ev)=>{
+    if(branchClickTimer){clearTimeout(branchClickTimer);branchClickTimer=null;}
     ev.preventDefault();ev.stopPropagation();
     const br=el.dataset.branch;
+    if(el.dataset.istag==='1'){filters.branch=br;applyF();highlightBranch(br);return;}
     const tracking=el.dataset.tracking;
     let target=tracking;
     if(!target){
@@ -1260,6 +1401,14 @@ function bindBI(el){
   el.oncontextmenu=ev=>{
     ev.preventDefault();ev.stopPropagation();
     const br=el.dataset.branch, isCur=el.classList.contains('cur');
+    if(el.dataset.istag==='1'){
+      showCtx(ev.clientX,ev.clientY,[
+        {icon:'\\u21AA',label:'Checkout',action:()=>vscode.postMessage({type:'checkoutBranch',branch:br})},
+        {sep:1},
+        {icon:'\\u{1F5D1}',label:'Delete Tag',action:()=>vscode.postMessage({type:'deleteTag',tag:br})}
+      ]);
+      return;
+    }
     const tracking=el.dataset.tracking;
     const items=[];
     items.push({icon:'\\u21AA',label:'Checkout',action:()=>vscode.postMessage({type:'checkoutBranch',branch:br})});
@@ -1741,10 +1890,39 @@ function pickBranch(name){
 }
 
 function highlightBranch(name){
-  $('bpContent').querySelectorAll('.branch-item').forEach(el=>{
-    el.style.background=el.dataset.branch===name?'var(--active)':'';
-    if(el.dataset.branch===name)el.scrollIntoView({block:'nearest'});
-  });
+  const p=$('bpContent'),hp=$('bpHead');
+  const setBg=(el,m)=>{el.style.background=m?'var(--active)':'';};
+  if(!name){
+    if(hp)hp.querySelectorAll('.branch-item').forEach(el=>setBg(el,false));
+    p.querySelectorAll('.branch-item').forEach(el=>setBg(el,false));
+    return;
+  }
+  if(branchViewMode==='tree')ensureBranchPathExpanded(name);
+  let found=null,foundInHead=false;
+  if(hp)hp.querySelectorAll('.branch-item').forEach(el=>{const m=el.dataset.branch===name;setBg(el,m);if(m&&!found){found=el;foundInHead=true;}});
+  p.querySelectorAll('.branch-item').forEach(el=>{const m=el.dataset.branch===name;setBg(el,m);if(m&&!found)found=el;});
+  if(!found||foundInHead)return;
+  for(let cur=found.parentElement;cur&&cur!==p;cur=cur.parentElement){
+    if((cur.classList.contains('tdir-ch')||cur.classList.contains('sec-body'))&&cur.style.display==='none'){
+      cur.style.display='';
+      const hd=cur.previousElementSibling;
+      if(hd){const arr=hd.querySelector('.arr');if(arr)arr.textContent='\\u25BC';const ico=hd.querySelector('.dir-ico');if(ico)ico.textContent='\\u{1F4C2}';}
+    }
+    if(cur.style&&cur.style.display==='none')cur.style.display='';
+  }
+  found.scrollIntoView({block:'nearest'});
+}
+
+function ensureBranchPathExpanded(name){
+  const isTag=allTags.includes(name);
+  const isRemote=!isTag&&allBranches.some(b=>b.remote&&b.name===name);
+  const prefix=isTag?'tag':(isRemote?'remote':'local');
+  const disp=isRemote?(typeof remoteTreeDisplayPath==='function'?remoteTreeDisplayPath(name):name):name;
+  const pts=disp.split('/').filter(Boolean);
+  if(pts.length<=1)return;
+  let path=prefix,added=false;
+  for(let i=0;i<pts.length-1;i++){path=path+'/'+pts[i];if(!branchTreeOpen.has(path)){branchTreeOpen.add(path);added=true;}}
+  if(added)renderBranches();
 }
 
 function filterBranchPanel(q){

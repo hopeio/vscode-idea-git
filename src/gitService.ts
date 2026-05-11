@@ -797,6 +797,40 @@ export class GitService {
     else { await this.git(repoPath, ['tag', name, hash]); }
   }
 
+  /** 解析 tag 指向的 commit hash（annotated/lightweight 都支持） */
+  async resolveTagCommit(repoPath: string, name: string): Promise<string> {
+    try { return (await this.git(repoPath, ['rev-list', '-n', '1', `refs/tags/${name}`])).trim(); }
+    catch { return ''; }
+  }
+
+  async deleteTag(repoPath: string, name: string): Promise<void> {
+    await this.git(repoPath, ['tag', '-d', name]);
+  }
+
+  async deleteRemoteTag(repoPath: string, name: string, remote: string = 'origin'): Promise<void> {
+    await this.git(repoPath, ['push', remote, '--delete', `refs/tags/${name}`]);
+  }
+
+  async resolveCommitOid(repoPath: string, ref: string): Promise<string> {
+    try { return (await this.git(repoPath, ['rev-parse', ref])).trim(); }
+    catch { return ref; }
+  }
+
+  /** 仅当存在「本地分支 + 已配置 upstream + 落后于 upstream」时视为有远端可拉更新（不含纯远端新分支等）。 */
+  async repoHasRemoteUpdates(repoPath: string): Promise<boolean> {
+    try {
+      const out = await this.git(repoPath, ['for-each-ref', 'refs/heads', '--format=%(upstream:track)\t%(upstream)']);
+      for (const line of out.trim().split('\n')) {
+        if (!line) { continue; }
+        const [track, upstream] = line.split('\t');
+        if (!upstream || !upstream.trim()) { continue; }
+        const t = track || '';
+        if (/\bbehind\s+\d+/i.test(t) || /落后\s*\d+/.test(t)) { return true; }
+      }
+    } catch { /* ignore */ }
+    return false;
+  }
+
   async dropCommit(repoPath: string, hash: string): Promise<void> {
     const terminal = vscode.window.createTerminal({ name: 'Git Drop Commit', cwd: repoPath });
     terminal.sendText(`GIT_SEQUENCE_EDITOR="sed -i '' 's/^pick ${hash.slice(0, 7)}/drop ${hash.slice(0, 7)}/'" git rebase -i ${hash}~1`);
