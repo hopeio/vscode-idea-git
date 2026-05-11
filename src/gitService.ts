@@ -49,7 +49,50 @@ export class GitService {
     for (const folder of workspaceFolders) {
       await this.findGitRoots(folder.uri.fsPath, 0, seen);
     }
+    this.repos = this.applyExcludeFilter(this.repos);
     return this.repos;
+  }
+
+  /** 仅扫描，不应用 excludeRepos 过滤，也不写入 this.repos。用于"管理排除项"命令。 */
+  async scanAllReposIgnoringExclude(workspaceFolders: readonly vscode.WorkspaceFolder[]): Promise<GitRepo[]> {
+    const backup = this.repos;
+    this.repos = [];
+    const seen = new Set<string>();
+    try {
+      for (const folder of workspaceFolders) {
+        await this.findGitRoots(folder.uri.fsPath, 0, seen);
+      }
+      return this.repos;
+    } finally {
+      this.repos = backup;
+    }
+  }
+
+  /** 依据 `ideaGit.excludeRepos` 配置过滤掉用户不想识别的仓库。 */
+  private applyExcludeFilter(repos: GitRepo[]): GitRepo[] {
+    const patterns = (vscode.workspace.getConfiguration('ideaGit').get<string[]>('excludeRepos') || [])
+      .map(s => (s || '').trim()).filter(Boolean);
+    if (!patterns.length) { return repos; }
+    return repos.filter(r => !patterns.some(p => this.matchExcludePattern(p, r)));
+  }
+
+  private matchExcludePattern(pat: string, repo: GitRepo): boolean {
+    const fwd = repo.rootPath.split(path.sep).join('/');
+    const hasSlash = pat.includes('/');
+    const hasStar = pat.includes('*');
+    if (!hasSlash && !hasStar) { return repo.name === pat; }
+    if (!hasSlash && hasStar) {
+      return this.globToRegex(pat, true).test(repo.name);
+    }
+    const re = this.globToRegex(pat, false);
+    return re.test(fwd) || re.test(repo.name) || (!hasStar && fwd.includes(pat));
+  }
+
+  /** 把 glob 转 RegExp。anchor=true 时强制完整匹配，否则只要任意位置出现即可（用于路径子串）。 */
+  private globToRegex(pat: string, anchor: boolean): RegExp {
+    const esc = pat.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    const body = esc.replace(/\*\*/g, '::DBLSTAR::').replace(/\*/g, '[^/]*').replace(/::DBLSTAR::/g, '.*');
+    return new RegExp(anchor ? '^' + body + '$' : body);
   }
 
   private async findGitRoots(dir: string, depth: number, seen: Set<string>): Promise<void> {
@@ -574,6 +617,49 @@ export class GitService {
     const dir = await this.resolveGitDir(repoPath);
     if (!dir) { return false; }
     return this.pathExists(path.join(dir, 'MERGE_HEAD'));
+  }
+
+  /**
+   * 读取当前 rebase/merge 进度信息：原始分支、目标(onto)、对端引用，以及（如适用）已完成/总步数。
+   * 失败时各字段为空字符串/0，调用方按需展示。
+   */
+  async getOperationInfo(repoPath: string): Promise<{ head: string; onto: string; ontoName: string; otherRef: string; done: number; total: number }> {
+    const empty = { head: '', onto: '', ontoName: '', otherRef: '', done: 0, total: 0 };
+    const dir = await this.resolveGitDir(repoPath);
+    if (!dir) { return empty; }
+    const readFile = async (rel: string) => {
+      try { return (await fs.promises.readFile(path.join(dir, rel), 'utf8')).trim(); } catch { return ''; }
+    };
+    const stripRef = (s: string) => s.replace(/^refs\/heads\//, '').replace(/^refs\/remotes\//, '');
+    const describe = async (ref: string) => {
+      if (!ref) { return ''; }
+      try { return (await this.git(repoPath, ['name-rev', '--name-only', '--no-undefined', ref])).trim(); }
+      catch { return ref.slice(0, 12); }
+    };
+    if (await this.pathExists(path.join(dir, 'rebase-merge'))) {
+      const head = stripRef(await readFile('rebase-merge/head-name'));
+      const ontoHash = await readFile('rebase-merge/onto');
+      const ontoName = await describe(ontoHash);
+      const done = Number(await readFile('rebase-merge/msgnum')) || 0;
+      const total = Number(await readFile('rebase-merge/end')) || 0;
+      return { head, onto: ontoHash.slice(0, 7), ontoName, otherRef: '', done, total };
+    }
+    if (await this.pathExists(path.join(dir, 'rebase-apply'))) {
+      const head = stripRef(await readFile('rebase-apply/head-name'));
+      const ontoHash = await readFile('rebase-apply/onto');
+      const ontoName = await describe(ontoHash);
+      const done = Number(await readFile('rebase-apply/next')) || 0;
+      const total = Number(await readFile('rebase-apply/last')) || 0;
+      return { head, onto: ontoHash.slice(0, 7), ontoName, otherRef: '', done, total };
+    }
+    if (await this.pathExists(path.join(dir, 'MERGE_HEAD'))) {
+      const mergeHead = await readFile('MERGE_HEAD');
+      const other = mergeHead.split('\n').filter(Boolean)[0] || '';
+      const otherRef = await describe(other);
+      const head = await this.getCurrentBranch(repoPath).catch(() => '');
+      return { head, onto: '', ontoName: '', otherRef: otherRef || other.slice(0, 7), done: 0, total: 0 };
+    }
+    return empty;
   }
 
   /** core.editor=true 让 git 在 commit message 阶段不阻塞编辑器 */

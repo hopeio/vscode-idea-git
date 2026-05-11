@@ -14,6 +14,18 @@ export async function activate(context: vscode.ExtensionContext) {
   const autoFetchIntervalSec = Math.max(60, cfg.get<number>('autoFetchIntervalSeconds', 300));
   let fetchTimer: NodeJS.Timeout | undefined;
   let isFetching = false;
+  const LAST_REPO_KEY = 'ideaGit.lastSelectedRepoPath';
+
+  const selectRepo = (repo: { rootPath: string } & { name: string }) => {
+    statusBar.setRepo(repo);
+    logProvider.setRepo(repo);
+    context.workspaceState.update(LAST_REPO_KEY, repo.rootPath);
+  };
+
+  const pickInitialRepo = (repos: { name: string; rootPath: string }[]) => {
+    const saved = context.workspaceState.get<string>(LAST_REPO_KEY);
+    return (saved && repos.find(r => r.rootPath === saved)) || repos[0];
+  };
 
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider('idea-git-diff', new GitDiffContentProvider(gitService)),
@@ -26,8 +38,7 @@ export async function activate(context: vscode.ExtensionContext) {
     if (!folders) { return; }
     const repos = await gitService.discoverRepos(folders);
     if (repos.length > 0) {
-      statusBar.setRepo(repos[0]);
-      logProvider.setRepo(repos[0]);
+      selectRepo(pickInitialRepo(repos));
       await statusBar.refresh();
     }
   }
@@ -142,8 +153,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (repos.length <= 1) { return; }
       const pick = await vscode.window.showQuickPick(repos.map(r => ({ label: r.name, description: r.rootPath, repo: r })), { placeHolder: '选择仓库' });
       if (!pick) { return; }
-      statusBar.setRepo(pick.repo);
-      logProvider.setRepo(pick.repo);
+      selectRepo(pick.repo);
       await statusBar.refresh();
       logProvider.refresh();
     }),
@@ -160,8 +170,10 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand('ideaGit.repoChanged', (repo) => {
       statusBar.setRepo(repo);
+      if (repo?.rootPath) { context.workspaceState.update(LAST_REPO_KEY, repo.rootPath); }
       statusBar.refresh();
-    })
+    }),
+    vscode.commands.registerCommand('ideaGit.manageExcludedRepos', () => manageExcludedRepos(gitService))
   );
 
   async function rescanRepos() {
@@ -172,8 +184,7 @@ export async function activate(context: vscode.ExtensionContext) {
       const current = logProvider.getCurrentRepo();
       const stillExists = current && repos.find(r => r.rootPath === current.rootPath);
       if (!stillExists) {
-        statusBar.setRepo(repos[0]);
-        logProvider.setRepo(repos[0]);
+        selectRepo(pickInitialRepo(repos));
       }
       await statusBar.refresh();
       logProvider.refresh();
@@ -198,6 +209,10 @@ export async function activate(context: vscode.ExtensionContext) {
 
   vscode.workspace.onDidChangeWorkspaceFolders(() => { rescanRepos(); }, null, context.subscriptions);
 
+  vscode.workspace.onDidChangeConfiguration((e) => {
+    if (e.affectsConfiguration('ideaGit.excludeRepos')) { rescanRepos(); }
+  }, null, context.subscriptions);
+
   if (autoFetchEnabled) {
     fetchTimer = setInterval(() => { doAutoFetch(); }, autoFetchIntervalSec * 1000);
     context.subscriptions.push(new vscode.Disposable(() => {
@@ -210,6 +225,34 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {}
+
+/**
+ * 通过 QuickPick 让用户从当前工作区可发现的所有仓库里选出要排除的，
+ * 结果写入 `ideaGit.excludeRepos`（workspace 级），保存使用 rootPath，避免重名歧义。
+ */
+async function manageExcludedRepos(gitService: GitService): Promise<void> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders) { vscode.window.showInformationMessage('没有打开的工作区'); return; }
+  const allRepos = await gitService.scanAllReposIgnoringExclude(folders);
+  if (!allRepos.length) { vscode.window.showInformationMessage('未发现任何 Git 仓库'); return; }
+  const cfg = vscode.workspace.getConfiguration('ideaGit');
+  const current = new Set(cfg.get<string[]>('excludeRepos') || []);
+  const items: (vscode.QuickPickItem & { rootPath: string })[] = allRepos.map(r => ({
+    label: r.name,
+    description: r.rootPath,
+    picked: current.has(r.rootPath) || current.has(r.name),
+    rootPath: r.rootPath,
+  }));
+  const picked = await vscode.window.showQuickPick(items, {
+    canPickMany: true,
+    placeHolder: '勾选要排除的仓库（按 Enter 保存）',
+    matchOnDescription: true,
+  });
+  if (!picked) { return; }
+  const newList = picked.map(i => i.rootPath);
+  await cfg.update('excludeRepos', newList, vscode.ConfigurationTarget.Workspace);
+  vscode.window.showInformationMessage(`已更新排除仓库列表（${newList.length} 项）`);
+}
 
 /**
  * 借助 VS Code 内置 `vscode.git` 扩展感知 HEAD/分支变化，比 file system watcher

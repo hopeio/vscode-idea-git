@@ -172,6 +172,34 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         await vscode.commands.executeCommand('ideaGit.refresh');
         break;
       }
+      case 'manageExcludedRepos': {
+        await vscode.commands.executeCommand('ideaGit.manageExcludedRepos');
+        break;
+      }
+      case 'opRebaseContinue':
+      case 'opRebaseSkip':
+      case 'opRebaseAbort':
+      case 'opMergeContinue':
+      case 'opMergeAbort': {
+        try {
+          if (msg.type === 'opRebaseContinue') { await this.gitService.rebaseContinue(repo); }
+          else if (msg.type === 'opRebaseSkip') { await this.gitService.rebaseSkip(repo); }
+          else if (msg.type === 'opRebaseAbort') { await this.gitService.rebaseAbort(repo); }
+          else if (msg.type === 'opMergeContinue') { await this.gitService.mergeContinue(repo); }
+          else if (msg.type === 'opMergeAbort') { await this.gitService.mergeAbort(repo); }
+          const stillRebase = await this.gitService.isRebasing(repo);
+          const stillMerge = await this.gitService.isMerging(repo);
+          if (!stillRebase && !stillMerge) {
+            vscode.window.showInformationMessage(
+              msg.type.endsWith('Abort') ? '已 Abort' : '操作已完成'
+            );
+          }
+        } catch (e: any) {
+          vscode.window.showWarningMessage(`${msg.type}: ${e?.message || e}`);
+        }
+        await this.refresh();
+        break;
+      }
       case 'newBranchFrom': {
         const name = await vscode.window.showInputBox({ prompt: `从 "${msg.branch}" 新建分支`, placeHolder: 'feature/new-branch' });
         if (!name) { break; }
@@ -891,8 +919,9 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       const { opts, emptyMe } = await this.buildGetLogOpts(repo, this.currentLogFilters, 0, LogViewProvider.INITIAL_PAGE_SIZE);
       const commits = emptyMe ? [] : await this.gitService.getLog(repo, opts);
       const repos = await this.buildReposWithUpdateFlags();
+      const inProgress = await this.detectInProgress(repo);
       if (mySeq !== this.logStaleSeq) { return; }
-      this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, repos, currentRepoPath: repo, activeFilters: this.currentLogFilters, append: false, hasMore: commits.length >= LogViewProvider.INITIAL_PAGE_SIZE });
+      this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, repos, currentRepoPath: repo, activeFilters: this.currentLogFilters, inProgress, append: false, hasMore: commits.length >= LogViewProvider.INITIAL_PAGE_SIZE });
     } catch (e: any) { vscode.window.showErrorMessage(`刷新失败: ${e.message}`); }
   }
 
@@ -916,6 +945,27 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
     const repos = this.gitService.getRepos();
     const flags = await Promise.all(repos.map(r => this.gitService.repoHasRemoteUpdates(r.rootPath).catch(() => false)));
     return repos.map((r, i) => ({ ...r, hasRemoteUpdates: flags[i] }));
+  }
+
+  /** 检测是否处于 rebase / merge 中，附带分支/进度/冲突数，用于面板顶部横幅展示。 */
+  private async detectInProgress(repo: string): Promise<{
+    rebase: boolean; merge: boolean; conflicts: number; repoName: string;
+    head: string; onto: string; ontoName: string; otherRef: string; done: number; total: number;
+  }> {
+    const repoName = this.currentRepo?.name || '';
+    const [rebase, merge] = await Promise.all([
+      this.gitService.isRebasing(repo).catch(() => false),
+      this.gitService.isMerging(repo).catch(() => false),
+    ]);
+    const base = { rebase, merge, conflicts: 0, repoName, head: '', onto: '', ontoName: '', otherRef: '', done: 0, total: 0 };
+    if (!rebase && !merge) { return base; }
+    try { base.conflicts = (await this.gitService.getConflictFiles(repo)).length; } catch { /* ignore */ }
+    try {
+      const info = await this.gitService.getOperationInfo(repo);
+      base.head = info.head; base.onto = info.onto; base.ontoName = info.ontoName;
+      base.otherRef = info.otherRef; base.done = info.done; base.total = info.total;
+    } catch { /* ignore */ }
+    return base;
   }
 
   /**
@@ -968,9 +1018,25 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size,13px
 .repo-update-badge{display:none;align-items:center;justify-content:center;gap:2px;min-width:20px;min-height:20px;padding:2px 7px;margin-right:4px;border-radius:10px;background:#f0883e;color:#1f1f1f;font-size:11px;font-weight:700;cursor:pointer;user-select:none;line-height:1;flex-shrink:0;white-space:nowrap;font-variant-numeric:tabular-nums}
 .repo-update-badge.show{display:inline-flex}
 .repo-update-badge:hover{filter:brightness(1.1)}
-.date-picker{position:fixed;display:flex;align-items:center;gap:6px;background:var(--vscode-menu-background,#252526);border:1px solid var(--border);border-radius:4px;padding:8px 10px;z-index:100;box-shadow:0 4px 12px rgba(0,0,0,.4)}
-.date-picker input{background:var(--input-bg);color:var(--input-fg);border:1px solid var(--input-border);padding:3px 6px;border-radius:3px;font-size:12px}
-.date-picker button{background:var(--badge);color:var(--badge-fg);border:none;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:12px}
+.tb-icon-btn{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;margin-right:4px;background:transparent;color:var(--fg);border:1px solid transparent;border-radius:3px;font-size:14px;line-height:1;cursor:pointer;flex-shrink:0;opacity:.75}
+.tb-icon-btn:hover{background:var(--hover);border-color:var(--input-border);opacity:1}
+.date-picker{position:fixed;display:flex;flex-direction:column;background:var(--vscode-menu-background,#252526);border:1px solid var(--border);border-radius:4px;padding:8px;z-index:100;box-shadow:0 4px 12px rgba(0,0,0,.4);font-size:12px;min-width:260px}
+.dp-head{display:flex;align-items:center;width:100%;margin-bottom:6px;gap:4px}
+.dp-head-side{display:flex;gap:2px;flex:0 0 72px;align-items:center}
+.dp-head-side.left{justify-content:flex-start}
+.dp-head-side.right{justify-content:flex-end}
+.dp-title{flex:1;min-width:0;text-align:center;font-weight:600;font-variant-numeric:tabular-nums}
+.dp-nav{background:transparent;border:1px solid transparent;color:var(--fg);border-radius:3px;cursor:pointer;padding:2px 6px;line-height:1;font-size:13px}
+.dp-nav:hover{background:var(--hover);border-color:var(--input-border)}
+.dp-grid{display:grid;grid-template-columns:repeat(7,30px);gap:2px}
+.dp-cell{height:24px;display:flex;align-items:center;justify-content:center;cursor:pointer;border-radius:3px;user-select:none}
+.dp-cell.head{color:var(--desc);cursor:default;font-weight:600;font-size:11px}
+.dp-cell.dim{opacity:.35}
+.dp-cell:hover:not(.head){background:var(--hover)}
+.dp-cell.today{outline:1px dashed var(--vscode-focusBorder,#007fd4);outline-offset:-2px}
+.dp-cell.range{background:var(--vscode-list-inactiveSelectionBackground,#3a3d41)}
+.dp-cell.endpoint{background:var(--active);color:var(--active-fg)}
+.dp-hint{margin-top:6px;color:var(--desc);font-size:11px}
 .main{display:flex;flex:1;overflow:hidden}
 .branch-panel{width:200px;min-width:140px;border-right:1px solid var(--border);flex-shrink:0;height:100%;overflow-y:auto;overflow-x:hidden;position:relative}
 .bp-pinned{position:sticky;top:0;z-index:5;background:var(--bg);box-shadow:0 1px 4px rgba(0,0,0,.3)}
@@ -1052,12 +1118,27 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size,13px
 .hidden{display:none}
 .resize-handle{width:4px;cursor:col-resize;flex-shrink:0}
 .resize-handle:hover{background:var(--vscode-focusBorder,#007fd4)}
+.op-banner{display:none;align-items:center;gap:8px;padding:4px 10px;background:var(--vscode-inputValidation-warningBackground,#5a4500);color:var(--vscode-inputValidation-warningForeground,#fff);border-bottom:1px solid var(--vscode-inputValidation-warningBorder,#b89500);font-size:12px}
+.op-banner.show{display:flex}
+.op-banner.merge{background:var(--vscode-inputValidation-infoBackground,#063b49);border-bottom-color:var(--vscode-inputValidation-infoBorder,#007acc)}
+.op-banner .op-label{font-weight:600}
+.op-banner .op-meta{opacity:.95}
+.op-banner .op-meta b{font-weight:600}
+.op-banner .op-sep{opacity:.5;margin:0 2px}
+.op-banner .op-conflicts{color:var(--vscode-errorForeground,#f48771);font-weight:600}
+.op-banner .op-btns{margin-left:auto;display:flex;gap:6px}
+.op-banner button{padding:2px 8px;font-size:12px;cursor:pointer;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground);border:1px solid var(--vscode-button-border,transparent);border-radius:3px}
+.op-banner button:hover{background:var(--vscode-button-secondaryHoverBackground)}
+.op-banner button.danger{background:var(--vscode-errorForeground,#a1260d);color:#fff;border-color:transparent}
+.op-banner button.danger:hover{filter:brightness(1.1)}
 </style></head>
 <body>
 <div class="root">
+  <div class="op-banner" id="opBanner"></div>
   <div class="toolbar" id="toolbar">
     <select class="tb-select" id="repoSelect" title="选择仓库" style="display:none"></select>
     <span id="repoUpdateBadge" class="repo-update-badge" title="点击执行 Refresh（fetch + 刷新）"></span>
+    <button class="tb-icon-btn" id="repoExcludeBtn" title="管理排除的仓库">&#x2699;</button>
     <div class="tb-search">
       <input id="branchInput" placeholder="Branch or tag" autocomplete="off">
       <div class="tb-dd" id="branchDD"></div>
@@ -1073,8 +1154,19 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size,13px
     <div class="pill" id="pillReset" title="Reset all filters" style="display:none">Reset</div>
   </div>
   <div class="date-picker hidden" id="datePicker" style="display:none">
-    <input type="date" id="dpFrom" title="From"><span style="color:var(--desc)">~</span><input type="date" id="dpTo" title="To">
-    <button id="dpApply">OK</button>
+    <div class="dp-head">
+      <div class="dp-head-side left">
+        <button class="dp-nav" id="dpPrevY" title="上一年">&#171;</button>
+        <button class="dp-nav" id="dpPrev" title="上个月">&#8249;</button>
+      </div>
+      <span class="dp-title" id="dpTitle"></span>
+      <div class="dp-head-side right">
+        <button class="dp-nav" id="dpNext" title="下个月">&#8250;</button>
+        <button class="dp-nav" id="dpNextY" title="下一年">&#187;</button>
+      </div>
+    </div>
+    <div class="dp-grid" id="dpGrid"></div>
+    <div class="dp-hint">先点起始日期，再点截止日期；范围内自动高亮。</div>
   </div>
   <div class="main">
     <div class="branch-panel" id="branchPanel">
@@ -1165,6 +1257,7 @@ window.addEventListener('message',e=>{
     logHasMore=typeof m.hasMore==='boolean'?m.hasMore:(incoming.length>=LOG_PAGE_SIZE);
     logLoadingMore=false;
     if(m.repos)renderRepoSelect(m.repos,m.currentRepoPath);
+    renderOpBanner(m.inProgress||null);
     const _sig=branchPanelSig();
     if(_sig!==lastBranchSig){lastBranchSig=_sig;renderBranches();}
     renderBranchFilter();renderAuthorList();renderFilterBar();renderLog(allCommits);
@@ -1199,7 +1292,7 @@ function renderRepoSelect(repos,cur){
       if(curHasUpdates)lines.push('当前仓库远端有未拉取的更新');
       if(otherUpdated.length)lines.push('以下仓库远端有更新：\\n  '+otherUpdated.map(r=>r.name).join('\\n  '));
       badge.title=lines.join('\\n')+'\\n\\n点击执行 Refresh（fetch + 刷新）';
-      badge.textContent=updatedRepos.length>1?String(updatedRepos.length):'!';
+      badge.textContent=String(updatedRepos.length);
     }else{
       badge.classList.remove('show');
     }
@@ -1214,6 +1307,39 @@ function renderRepoSelect(repos,cur){
   }).join('');
 }
 $('repoUpdateBadge').onclick=()=>{vscode.postMessage({type:'refreshRepos'});};
+$('repoExcludeBtn').onclick=()=>{vscode.postMessage({type:'manageExcludedRepos'});};
+function renderOpBanner(ip){
+  const el=$('opBanner');if(!el)return;
+  if(!ip||(!ip.rebase&&!ip.merge)){el.className='op-banner';el.innerHTML='';return;}
+  const isMerge=!!ip.merge,isRebase=!!ip.rebase;
+  el.className='op-banner show'+(isMerge&&!isRebase?' merge':'');
+  const parts=[];
+  parts.push('<span class="op-label">'+(isRebase?'Rebase':'Merge')+' in progress</span>');
+  if(ip.repoName)parts.push('<span class="op-meta">仓库: <b>'+eh(ip.repoName)+'</b></span>');
+  if(isRebase){
+    if(ip.head)parts.push('<span class="op-meta">分支: <b>'+eh(ip.head)+'</b></span>');
+    const onto=ip.ontoName||ip.onto;
+    if(onto)parts.push('<span class="op-meta">onto: <b>'+eh(onto)+'</b></span>');
+    if(ip.total>0)parts.push('<span class="op-meta">进度: '+ip.done+'/'+ip.total+'</span>');
+  }else{
+    if(ip.head)parts.push('<span class="op-meta">当前: <b>'+eh(ip.head)+'</b></span>');
+    if(ip.otherRef)parts.push('<span class="op-meta">合入: <b>'+eh(ip.otherRef)+'</b></span>');
+  }
+  parts.push(ip.conflicts>0
+    ?'<span class="op-conflicts">'+ip.conflicts+' 个冲突待解决</span>'
+    :'<span style="opacity:.85">无未解决冲突</span>');
+  const btns=isRebase
+    ?'<button data-op="opRebaseContinue">Continue</button><button data-op="opRebaseSkip">Skip</button><button class="danger" data-op="opRebaseAbort">Abort</button>'
+    :'<button data-op="opMergeContinue">Commit</button><button class="danger" data-op="opMergeAbort">Abort</button>';
+  el.innerHTML=parts.join('<span class="op-sep">·</span>')+'<div class="op-btns">'+btns+'</div>';
+  el.querySelectorAll('button[data-op]').forEach(b=>{
+    b.onclick=()=>{
+      const op=b.getAttribute('data-op');
+      if(op&&op.endsWith('Abort')&&!confirm('确认 Abort 当前操作？'))return;
+      vscode.postMessage({type:op});
+    };
+  });
+}
 $('repoSelect').onchange=e=>{
   filters.branch='';filters.author='';filters.after='';filters.before='';filters.path='';
   $('branchInput').value='';$('searchInput').value='';$('pathInput').value='';
@@ -1773,14 +1899,16 @@ function showCtx(x,y,items){
   });
 }
 function hideMenus(){$('ctxMenu').classList.add('hidden');$('ctxSubMenu').classList.add('hidden');$('datePicker').style.display='none';lastPillAct='';}
-function hideCtxMenusOnly(){$('ctxMenu').classList.add('hidden');$('ctxSubMenu').classList.add('hidden');lastPillAct='';}
-document.onclick=ev=>{
+function datePickerOpen(){const dp=$('datePicker');return dp&&dp.style.display==='flex';}
+/** 捕获阶段 mousedown：在 click 冒泡被拦截前也能收起日期面板 / 右键菜单 */
+function onGlobalPointerDown(ev){
   const dp=$('datePicker'),cm=$('ctxMenu'),sub=$('ctxSubMenu'),t=ev.target;
-  if(dp.style.display==='flex'&&(t===dp||dp.contains(t)))return;
+  if(datePickerOpen()&&(t===dp||dp.contains(t)))return;
   if(cm===t||cm.contains(t)||sub===t||sub.contains(t))return;
   hideMenus();
-};
-window.addEventListener('blur',()=>{hideCtxMenusOnly();});
+}
+window.addEventListener('mousedown',onGlobalPointerDown,true);
+window.addEventListener('blur',()=>{hideMenus();});
 document.addEventListener('scroll',ev=>{
   if(ev.target===$('ctxMenu')||$('ctxMenu').contains(ev.target))return;
   if(ev.target===$('ctxSubMenu')||$('ctxSubMenu').contains(ev.target))return;
@@ -1848,13 +1976,74 @@ function onPillBtn(act,ev){
     setTimeout(()=>showCtx(rect.left,rect.bottom+2,items),0);
   }else if(act==='date'){
     dp.style.display='flex';
-    $('dpFrom').value=filters.after||'';$('dpTo').value=filters.before||'';
     dp.style.left=rect.left+'px';dp.style.top=(rect.bottom+2)+'px';
+    dpOpenAt();
   }
 }
 
 $('pillReset').onclick=()=>resetAllFilters();
-$('dpApply').onclick=ev=>{ev.stopPropagation();filters.after=$('dpFrom').value;filters.before=$('dpTo').value;$('datePicker').style.display='none';lastPillAct='';applyF();};
+let dpViewYM={y:0,m:0};
+const dpSel={from:'',to:''};
+function dpYMD(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+function dpParse(s){const [y,m,d]=(s||'').split('-').map(Number);return (y&&m&&d)?new Date(y,m-1,d):null;}
+function dpOpenAt(){
+  dpSel.from=filters.after||'';dpSel.to=filters.before||'';
+  const seed=dpParse(dpSel.from)||dpParse(dpSel.to)||new Date();
+  dpViewYM={y:seed.getFullYear(),m:seed.getMonth()};
+  dpRender();
+}
+function dpAddMonths(delta){
+  let y=dpViewYM.y,m=dpViewYM.m+delta;
+  while(m<0){m+=12;y--;}
+  while(m>11){m-=12;y++;}
+  dpViewYM={y,m};
+}
+function dpRender(){
+  const today=dpYMD(new Date());
+  $('dpTitle').textContent=dpViewYM.y+'\u5e74'+String(dpViewYM.m+1).padStart(2,'0')+'\u6708';
+  const first=new Date(dpViewYM.y,dpViewYM.m,1);
+  const startDow=first.getDay();
+  const totalDays=new Date(dpViewYM.y,dpViewYM.m+1,0).getDate();
+  const cells=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(h=>'<div class="dp-cell head">'+h+'</div>');
+  const prevTotal=new Date(dpViewYM.y,dpViewYM.m,0).getDate();
+  for(let i=0;i<startDow;i++){
+    const date=new Date(dpViewYM.y,dpViewYM.m-1,prevTotal-startDow+1+i);
+    cells.push(dpMakeCell(date,true,today));
+  }
+  for(let d=1;d<=totalDays;d++){
+    cells.push(dpMakeCell(new Date(dpViewYM.y,dpViewYM.m,d),false,today));
+  }
+  const rest=42-(startDow+totalDays);
+  for(let i=1;i<=rest;i++){
+    cells.push(dpMakeCell(new Date(dpViewYM.y,dpViewYM.m+1,i),true,today));
+  }
+  const grid=$('dpGrid');grid.innerHTML=cells.join('');
+  grid.querySelectorAll('.dp-cell[data-ymd]').forEach(el=>{el.onclick=ev=>{ev.stopPropagation();dpPick(el.getAttribute('data-ymd'));};});
+}
+function dpMakeCell(date,dim,today){
+  const ymd=dpYMD(date);
+  let cls='dp-cell'+(dim?' dim':'');
+  if(dpSel.from&&dpSel.to&&ymd>dpSel.from&&ymd<dpSel.to)cls+=' range';
+  if(ymd===dpSel.from||ymd===dpSel.to)cls+=' endpoint';
+  if(ymd===today)cls+=' today';
+  return '<div class="'+cls+'" data-ymd="'+ymd+'">'+date.getDate()+'</div>';
+}
+function dpPick(ymd){
+  if(!dpSel.from||(dpSel.from&&dpSel.to)){
+    dpSel.from=ymd;dpSel.to='';
+  }else if(ymd<dpSel.from){
+    dpSel.to=dpSel.from;dpSel.from=ymd;
+  }else{
+    dpSel.to=ymd;
+  }
+  filters.after=dpSel.from;filters.before=dpSel.to;
+  dpRender();
+  if(dpSel.from&&dpSel.to){applyF();hideMenus();}
+}
+$('dpPrevY').onclick=ev=>{ev.stopPropagation();dpAddMonths(-12);dpRender();};
+$('dpPrev').onclick=ev=>{ev.stopPropagation();dpAddMonths(-1);dpRender();};
+$('dpNext').onclick=ev=>{ev.stopPropagation();dpAddMonths(1);dpRender();};
+$('dpNextY').onclick=ev=>{ev.stopPropagation();dpAddMonths(12);dpRender();};
 (function(){const dp=$('datePicker');dp.addEventListener('mousedown',ev=>ev.stopPropagation());dp.addEventListener('click',ev=>ev.stopPropagation());})();
 
 let pathTimer=null;

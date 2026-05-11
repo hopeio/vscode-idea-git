@@ -34,6 +34,12 @@
           "default": 300,
           "minimum": 60,
           "description": "Auto-fetch interval in seconds."
+        },
+        "ideaGit.excludeRepos": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "markdownDescription": "需要排除（不识别）的仓库。可填写：\n- 仓库名（精确匹配，例如 `node_modules-cache`）\n- 绝对路径或相对路径片段（例如 `/Users/me/code/foo` 或 `vendor/foo`）\n- 支持 `*` 通配符（例如 `tmp-*` 或 `**/build/*`）"
         }
       }
     },
@@ -85,6 +91,11 @@
       {
         "command": "ideaGit.fileHistory",
         "title": "IDEA Git: File History"
+      },
+      {
+        "command": "ideaGit.manageExcludedRepos",
+        "title": "IDEA Git: Manage Excluded Repositories",
+        "icon": "$(filter)"
       }
     ],
     "viewsContainers": {
@@ -117,7 +128,12 @@
         {
           "command": "ideaGit.refresh",
           "when": "view == ideaGit.logView",
-          "group": "navigation"
+          "group": "navigation@1"
+        },
+        {
+          "command": "ideaGit.manageExcludedRepos",
+          "when": "view == ideaGit.logView",
+          "group": "navigation@2"
         }
       ]
     }
