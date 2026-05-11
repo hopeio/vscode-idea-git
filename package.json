@@ -124,6 +124,20 @@
           "group": "navigation"
         }
       ],
+      "editor/context": [
+        {
+          "command": "ideaGit.fileHistory",
+          "when": "resourceScheme == file",
+          "group": "navigation@99"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "ideaGit.fileHistory",
+          "when": "resourceScheme == file",
+          "group": "1_close@99"
+        }
+      ],
       "view/title": [
         {
           "command": "ideaGit.refresh",

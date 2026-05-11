@@ -734,15 +734,15 @@ export class GitService {
     }
     let shelved = false;
     let stashRef: string | undefined;
+    if (await this.hasUncommittedChanges(repoPath)) {
+      stashRef = await this.stash(repoPath, `pull --rebase: ${target}`);
+      shelved = !!stashRef || true;
+    }
     try {
       await this.pullBranch(repoPath);
     } catch (e) {
-      // 已进入 rebase（含子模块/普通文件冲突）→ 不再尝试 smartCheckout/Shelve；交由上层的 handleRebaseConflict 引导处理
-      if (await this.isRebasing(repoPath)) { throw e; }
-      const switched = await this.smartCheckout(repoPath, target);
-      shelved = switched.shelved;
-      stashRef = switched.stashRef;
-      await this.pullBranch(repoPath);
+      // 已进入 rebase（含子模块/普通文件冲突）→ 保留 stash，交由上层的 handleRebaseConflict 引导处理
+      throw e;
     }
     let unshelveConflicts: string[] = [];
     if (shelved) {
@@ -827,13 +827,24 @@ export class GitService {
     return { rebased: true };
   }
 
-  async pullFromTracking(repoPath: string, tracking: string, useRebase: boolean): Promise<void> {
+  async pullFromTracking(repoPath: string, tracking: string, useRebase: boolean): Promise<{ shelved: boolean; stashRef?: string; unshelveConflicts: string[] }> {
     const parts = tracking.split('/');
     if (parts.length < 2) { throw new Error(`非法 tracking 分支: ${tracking}`); }
     const remote = parts[0];
     const remoteBranch = parts.slice(1).join('/');
-    const args = ['pull', useRebase ? '--rebase' : '--no-rebase', remote, remoteBranch];
-    await this.git(repoPath, args);
+    let shelved = false;
+    let stashRef: string | undefined;
+    if (await this.hasUncommittedChanges(repoPath)) {
+      stashRef = await this.stash(repoPath, `pull ${useRebase ? '--rebase' : '--no-rebase'}: ${tracking}`);
+      shelved = !!stashRef || true;
+    }
+    await this.git(repoPath, ['pull', useRebase ? '--rebase' : '--no-rebase', remote, remoteBranch]);
+    let unshelveConflicts: string[] = [];
+    if (shelved) {
+      const un = await this.unshelve(repoPath);
+      if (!un.ok) { unshelveConflicts = un.conflictFiles; }
+    }
+    return { shelved, stashRef, unshelveConflicts };
   }
 
   async compareBranches(repoPath: string, from: string, to: string): Promise<string> {

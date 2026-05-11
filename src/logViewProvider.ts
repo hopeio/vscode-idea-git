@@ -345,11 +345,11 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
             break;
           case 'pullRebase':
             await ensureTarget();
-            await this.gitService.pullFromTracking(repo, tracking, true);
+            await this.notifyPullResult(repo, await this.gitService.pullFromTracking(repo, tracking, true));
             break;
           case 'pullMerge':
             await ensureTarget();
-            await this.gitService.pullFromTracking(repo, tracking, false);
+            await this.notifyPullResult(repo, await this.gitService.pullFromTracking(repo, tracking, false));
             break;
         }
         await this.refresh();
@@ -407,11 +407,11 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
             break;
           case 'pullRebase':
             await ensureTarget();
-            await this.gitService.pullFromTracking(repo, tracking, true);
+            await this.notifyPullResult(repo, await this.gitService.pullFromTracking(repo, tracking, true));
             break;
           case 'pullMerge':
             await ensureTarget();
-            await this.gitService.pullFromTracking(repo, tracking, false);
+            await this.notifyPullResult(repo, await this.gitService.pullFromTracking(repo, tracking, false));
             break;
         }
         await this.refresh();
@@ -803,6 +803,22 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
   /** 切到 VS Code 内置源代码管理（Git）视图，在 Merge Changes 等区域解决冲突。 */
   private async focusSourceControlForConflicts(): Promise<void> {
     try { await vscode.commands.executeCommand('workbench.view.scm'); } catch { /* ignore */ }
+  }
+
+  /** pullFromTracking 结束后展示通用提示，含 unshelve 冲突提醒。 */
+  private async notifyPullResult(repo: string, res: { shelved: boolean; stashRef?: string; unshelveConflicts: string[] }): Promise<void> {
+    if (res.unshelveConflicts.length > 0) {
+      const stashHint = res.stashRef ? `（已保留 ${res.stashRef}，可手动 git stash pop）` : '';
+      const open = await vscode.window.showWarningMessage(
+        `Pull 已完成；自动 Unshelve 冲突 ${res.unshelveConflicts.length} 个文件${stashHint}。`,
+        '打开冲突文件'
+      );
+      if (open === '打开冲突文件') { await this.gitService.openConflictFiles(repo, res.unshelveConflicts); }
+    } else if (res.shelved) {
+      vscode.window.showInformationMessage(`Pull 已完成；已自动恢复 Shelve 的改动${res.stashRef ? `（${res.stashRef}）` : ''}`);
+    } else {
+      vscode.window.showInformationMessage('Pull 已完成');
+    }
   }
 
   /** 切分支后若产生 Shelve（stash），自动尝试 Unshelve；冲突时引导到源代码管理。 */
