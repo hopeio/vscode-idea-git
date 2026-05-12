@@ -9,6 +9,8 @@ const execFileAsync = promisify(execFile);
 export interface GitRepo {
   name: string;
   rootPath: string;
+  /** 多根工作区中该仓库所属的 VS Code 工作区文件夹名（`.code-workspace` 里 `folders[].name`） */
+  workspaceFolderName?: string;
 }
 
 export interface GitBranch {
@@ -71,9 +73,10 @@ export class GitService implements vscode.Disposable {
     this.repos = [];
     const seen = new Set<string>();
     for (const folder of workspaceFolders) {
-      await this.findGitRoots(folder.uri.fsPath, 0, seen);
+      await this.findGitRoots(folder.uri.fsPath, 0, seen, folder);
     }
     this.repos = this.applyExcludeFilter(this.repos);
+    this.dedupeRepoDisplayNames(this.repos);
     return this.repos;
   }
 
@@ -84,8 +87,9 @@ export class GitService implements vscode.Disposable {
     const seen = new Set<string>();
     try {
       for (const folder of workspaceFolders) {
-        await this.findGitRoots(folder.uri.fsPath, 0, seen);
+        await this.findGitRoots(folder.uri.fsPath, 0, seen, folder);
       }
+      this.dedupeRepoDisplayNames(this.repos);
       return this.repos;
     } finally {
       this.repos = backup;
@@ -119,15 +123,50 @@ export class GitService implements vscode.Disposable {
     return new RegExp(anchor ? '^' + body + '$' : body);
   }
 
-  private async findGitRoots(dir: string, depth: number, seen: Set<string>): Promise<void> {
+  /** 多根工作区下为同名展示名追加路径片段，避免下拉框无法区分。 */
+  private dedupeRepoDisplayNames(repos: GitRepo[]): void {
+    const groups = new Map<string, GitRepo[]>();
+    for (const r of repos) {
+      const g = groups.get(r.name) || [];
+      g.push(r);
+      groups.set(r.name, g);
+    }
+    for (const list of groups.values()) {
+      if (list.length < 2) { continue; }
+      for (const r of list) {
+        const segs = r.rootPath.replace(/\\/g, '/').split('/').filter(Boolean);
+        const hint = segs.slice(-2).join('/') || r.rootPath;
+        r.name = `${r.name} — ${hint}`;
+      }
+    }
+  }
+
+  /** 根目录与所属工作区文件夹一致时用文件夹名；嵌套仓库用「工作区名 › 相对路径」。 */
+  private makeRepoLabel(wsFolder: vscode.WorkspaceFolder, repoRoot: string, isSubmodule: boolean): string {
+    const suf = isSubmodule ? ' [submodule]' : '';
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length <= 1) {
+      return path.basename(repoRoot) + suf;
+    }
+    const wf = path.normalize(wsFolder.uri.fsPath);
+    const rr = path.normalize(repoRoot);
+    if (rr === wf) { return `${wsFolder.name}${suf}`; }
+    let rel = '';
+    try { rel = path.relative(wsFolder.uri.fsPath, repoRoot).split(path.sep).join('/'); } catch { rel = ''; }
+    if (!rel || rel.startsWith('..')) { return `${wsFolder.name}: ${path.basename(repoRoot)}${suf}`; }
+    return `${wsFolder.name} › ${rel}${suf}`;
+  }
+
+  private async findGitRoots(dir: string, depth: number, seen: Set<string>, wsFolder: vscode.WorkspaceFolder): Promise<void> {
     if (depth > 3 || seen.has(dir)) { return; }
     seen.add(dir);
     const gitDir = path.join(dir, '.git');
     try {
       const stat = await fs.promises.stat(gitDir);
       if (stat.isDirectory() || stat.isFile()) {
-        this.repos.push({ name: path.basename(dir), rootPath: dir });
-        await this.discoverSubmodules(dir, seen);
+        const name = this.makeRepoLabel(wsFolder, dir, false);
+        this.repos.push({ name, rootPath: dir, workspaceFolderName: wsFolder.name });
+        await this.discoverSubmodules(dir, seen, wsFolder);
         return;
       }
     } catch { /* not a git root */ }
@@ -136,13 +175,13 @@ export class GitService implements vscode.Disposable {
       const entries = await fs.promises.readdir(dir, { withFileTypes: true });
       for (const e of entries) {
         if (e.isDirectory() && !e.name.startsWith('.') && e.name !== 'node_modules') {
-          await this.findGitRoots(path.join(dir, e.name), depth + 1, seen);
+          await this.findGitRoots(path.join(dir, e.name), depth + 1, seen, wsFolder);
         }
       }
     } catch { /* ignore permission errors */ }
   }
 
-  private async discoverSubmodules(repoDir: string, seen: Set<string>): Promise<void> {
+  private async discoverSubmodules(repoDir: string, seen: Set<string>, wsFolder: vscode.WorkspaceFolder): Promise<void> {
     try {
       const out = await this.git(repoDir, ['submodule', 'foreach', '--quiet', '--recursive', 'echo $sm_path']);
       for (const line of out.trim().split('\n')) {
@@ -152,7 +191,8 @@ export class GitService implements vscode.Disposable {
         seen.add(subPath);
         try {
           await fs.promises.stat(path.join(subPath, '.git'));
-          this.repos.push({ name: path.basename(subPath) + ' [submodule]', rootPath: subPath });
+          const name = this.makeRepoLabel(wsFolder, subPath, true);
+          this.repos.push({ name, rootPath: subPath, workspaceFolderName: wsFolder.name });
         } catch { /* submodule not initialized */ }
       }
     } catch { /* no submodules or git error */ }

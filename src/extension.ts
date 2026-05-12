@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { GitService } from './gitService';
+import { GitService, GitRepo } from './gitService';
 import { StatusBarManager } from './statusBar';
 import { LogViewProvider } from './logViewProvider';
 import { GitDiffContentProvider } from './diffProvider';
@@ -26,6 +26,9 @@ export async function activate(context: vscode.ExtensionContext) {
     const saved = context.workspaceState.get<string>(LAST_REPO_KEY);
     return (saved && repos.find(r => r.rootPath === saved)) || repos[0];
   };
+
+  /** 命令面板操作的目标仓库：Git Log 当前选中项，否则第一个已发现仓库。 */
+  const pickRepoForCommands = (): GitRepo | undefined => logProvider.getCurrentRepo() ?? gitService.getRepos()[0];
 
   context.subscriptions.push(
     { dispose: () => gitService.dispose() },
@@ -81,9 +84,8 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('ideaGit.switchBranch', () => statusBar.switchBranch()),
     vscode.commands.registerCommand('ideaGit.createBranch', async () => {
-      const repos = gitService.getRepos();
-      if (repos.length === 0) { return; }
-      const repo = repos[0];
+      const repo = pickRepoForCommands();
+      if (!repo) { vscode.window.showWarningMessage('当前工作区未发现 Git 仓库'); return; }
       const name = await vscode.window.showInputBox({ prompt: '新分支名称', placeHolder: 'feature/my-branch' });
       if (!name) { return; }
       try {
@@ -94,9 +96,8 @@ export async function activate(context: vscode.ExtensionContext) {
       } catch (e: any) { vscode.window.showErrorMessage(`创建分支失败: ${e.message}`); }
     }),
     vscode.commands.registerCommand('ideaGit.renameBranch', async () => {
-      const repos = gitService.getRepos();
-      if (repos.length === 0) { return; }
-      const repo = repos[0];
+      const repo = pickRepoForCommands();
+      if (!repo) { vscode.window.showWarningMessage('当前工作区未发现 Git 仓库'); return; }
       const current = await gitService.getCurrentBranch(repo.rootPath);
       const newName = await vscode.window.showInputBox({ prompt: `重命名分支 "${current}" 为`, value: current });
       if (!newName || newName === current) { return; }
@@ -108,9 +109,8 @@ export async function activate(context: vscode.ExtensionContext) {
       } catch (e: any) { vscode.window.showErrorMessage(`重命名分支失败: ${e.message}`); }
     }),
     vscode.commands.registerCommand('ideaGit.deleteBranch', async () => {
-      const repos = gitService.getRepos();
-      if (repos.length === 0) { return; }
-      const repo = repos[0];
+      const repo = pickRepoForCommands();
+      if (!repo) { vscode.window.showWarningMessage('当前工作区未发现 Git 仓库'); return; }
       const branches = await gitService.getBranches(repo.rootPath);
       const items = branches.filter(b => !b.current && !b.remote).map(b => b.name);
       const pick = await vscode.window.showQuickPick(items, { placeHolder: '选择要删除的分支' });

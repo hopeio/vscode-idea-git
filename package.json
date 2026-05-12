@@ -1,7 +1,7 @@
 {
   "name": "idea-git",
   "displayName": "IDEA Git",
-  "description": "IntelliJ IDEA style Git branch management, log viewer with commit graph, Smart Checkout and more.",
+  "description": "IntelliJ IDEA style Git branch management, log viewer with commit graph, Smart Checkout and more. Supports multi-root VS Code workspaces.",
   "version": "0.1.0",
   "publisher": "hopeio",
   "engines": {
