@@ -40,8 +40,32 @@ export interface GitFileChange {
   oldPath?: string;
 }
 
-export class GitService {
+export class GitService implements vscode.Disposable {
   private repos: GitRepo[] = [];
+  private gitCmdLog?: vscode.OutputChannel;
+
+  dispose(): void {
+    this.gitCmdLog?.dispose();
+    this.gitCmdLog = undefined;
+  }
+
+  /** 打开「IDEA Git · Git 命令」输出面板（需已开启 ideaGit.logGitCommands 并至少执行过一次 git）。 */
+  showGitCommandLog(): void {
+    if (!this.gitCmdLog) {
+      vscode.window.showInformationMessage('请先在设置中开启 ideaGit.logGitCommands，并执行一次 Git 操作后再试。');
+      return;
+    }
+    this.gitCmdLog.show(true);
+  }
+
+  private maybeLogGitCommand(repoPath: string, args: string[]): void {
+    try {
+      if (!vscode.workspace.getConfiguration('ideaGit').get<boolean>('logGitCommands', false)) { return; }
+      if (!this.gitCmdLog) { this.gitCmdLog = vscode.window.createOutputChannel('IDEA Git · Git 命令'); }
+      const q = (s: string) => (/[^\w@%+=:,./-]/.test(s) ? JSON.stringify(s) : s);
+      this.gitCmdLog.appendLine(`${repoPath}> git -c core.quotepath=false ${args.map(q).join(' ')}`);
+    } catch { /* ignore */ }
+  }
 
   async discoverRepos(workspaceFolders: readonly vscode.WorkspaceFolder[]): Promise<GitRepo[]> {
     this.repos = [];
@@ -135,6 +159,7 @@ export class GitService {
   }
 
   private async git(repoPath: string, args: string[]): Promise<string> {
+    this.maybeLogGitCommand(repoPath, args);
     const { stdout } = await execFileAsync('git', ['-c', 'core.quotepath=false', ...args], { cwd: repoPath, maxBuffer: 50 * 1024 * 1024 });
     return stdout;
   }
@@ -700,9 +725,46 @@ export class GitService {
     } catch { return false; }
   }
 
-  /** Update 当前分支：固定 `pull --rebase`；冲突（含子模块）由调用方引导用户手动处理。 */
-  async pullBranch(repoPath: string): Promise<void> {
-    await this.git(repoPath, ['pull', '--rebase']);
+  /**
+   * fetch 远端分支后对 `remote/branch` 做 merge（不经过 `git pull`）。
+   * rebase 路径请用 `rebaseOntoRemoteTracking`，以便在有本地改动时使用 `--autostash`。
+   */
+  private async fetchAndMergeRemoteBranch(repoPath: string, remote: string, remoteBranch: string): Promise<void> {
+    await this.git(repoPath, ['fetch', remote, remoteBranch]);
+    const onto = `${remote}/${remoteBranch}`;
+    await this.git(repoPath, ['merge', '--no-edit', onto]);
+  }
+
+  /** fetch 后对 `remote/branch` 做 rebase；有本地改动时用 `--autostash`（避免手写 stash + pop 与子模块/未跟踪文件组合时误报冲突）。 */
+  private async rebaseOntoRemoteTracking(repoPath: string, remote: string, remoteBranch: string, dirty: boolean): Promise<void> {
+    await this.git(repoPath, ['fetch', remote, remoteBranch]);
+    const onto = `${remote}/${remoteBranch}`;
+    if (dirty) { await this.git(repoPath, ['rebase', '--autostash', onto]); }
+    else { await this.git(repoPath, ['rebase', onto]); }
+  }
+
+  /**
+   * Update：对上游 tracking fetch 后 rebase；有未提交改动时使用 `rebase --autostash`，不再 `stash push -u` + `stash pop`。
+   * 返回的 `unshelveConflicts` 表示 rebase 完成后自动恢复工作区时仍存在的未合并路径（若为空则一切正常）。
+   */
+  async pullBranch(repoPath: string, localBranch: string): Promise<{ hadLocalChanges: boolean; unshelveConflicts: string[]; stashRef?: string }> {
+    const tracking = await this.getTrackingBranch(repoPath, localBranch);
+    if (!tracking) {
+      throw new Error(`分支 "${localBranch}" 未设置上游跟踪分支，无法 Update。请先执行 git push -u 或配置 branch.${localBranch}.remote / merge。`);
+    }
+    const parts = tracking.split('/');
+    if (parts.length < 2) { throw new Error(`非法 tracking 分支: ${tracking}`); }
+    const remote = parts[0];
+    const remoteBranch = parts.slice(1).join('/');
+    const dirty = await this.hasUncommittedChanges(repoPath);
+    await this.rebaseOntoRemoteTracking(repoPath, remote, remoteBranch, dirty);
+    const unshelveConflicts = await this.getConflictFiles(repoPath);
+    let stashRef: string | undefined;
+    if (dirty && unshelveConflicts.length > 0) {
+      try { stashRef = (await this.git(repoPath, ['stash', 'list', '-n', '1', '--format=%gd'])).trim() || undefined; }
+      catch { /* ignore */ }
+    }
+    return { hadLocalChanges: dirty, unshelveConflicts, stashRef };
   }
 
   async smartUpdateBranch(repoPath: string, branch: string): Promise<{ updated: boolean; shelved: boolean; branch: string; stashRef?: string; unshelveConflicts: string[] }> {
@@ -732,25 +794,21 @@ export class GitService {
       await this.git(repoPath, ['branch', '-f', target, tracking]);
       return { updated: true, shelved: false, branch: target, unshelveConflicts: [] };
     }
-    let shelved = false;
-    let stashRef: string | undefined;
-    if (await this.hasUncommittedChanges(repoPath)) {
-      stashRef = await this.stash(repoPath, `pull --rebase: ${target}`);
-      shelved = !!stashRef || true;
-    }
+    let pullRes: { hadLocalChanges: boolean; unshelveConflicts: string[]; stashRef?: string };
     try {
-      await this.pullBranch(repoPath);
+      pullRes = await this.pullBranch(repoPath, target);
     } catch (e) {
-      // 已进入 rebase（含子模块/普通文件冲突）→ 保留 stash，交由上层的 handleRebaseConflict 引导处理
+      // 已进入 rebase（含子模块/普通文件冲突）→ 交由上层的 handleRebaseConflict 引导处理
       throw e;
     }
-    let unshelveConflicts: string[] = [];
-    if (shelved) {
-      const un = await this.unshelve(repoPath);
-      if (!un.ok) { unshelveConflicts = un.conflictFiles; }
-    }
     const after = await this.revParseMaybe(repoPath, target);
-    return { updated: !!before && !!after && before !== after, shelved, branch: target, stashRef, unshelveConflicts };
+    return {
+      updated: !!before && !!after && before !== after,
+      shelved: pullRes.hadLocalChanges,
+      branch: target,
+      stashRef: pullRes.stashRef,
+      unshelveConflicts: pullRes.unshelveConflicts,
+    };
   }
 
   async getConflictFiles(repoPath: string): Promise<string[]> {
@@ -832,14 +890,25 @@ export class GitService {
     if (parts.length < 2) { throw new Error(`非法 tracking 分支: ${tracking}`); }
     const remote = parts[0];
     const remoteBranch = parts.slice(1).join('/');
+    const dirty = await this.hasUncommittedChanges(repoPath);
     let shelved = false;
     let stashRef: string | undefined;
-    if (await this.hasUncommittedChanges(repoPath)) {
-      stashRef = await this.stash(repoPath, `pull ${useRebase ? '--rebase' : '--no-rebase'}: ${tracking}`);
+    let unshelveConflicts: string[] = [];
+    if (useRebase) {
+      await this.rebaseOntoRemoteTracking(repoPath, remote, remoteBranch, dirty);
+      shelved = dirty;
+      unshelveConflicts = await this.getConflictFiles(repoPath);
+      if (dirty && unshelveConflicts.length > 0) {
+        try { stashRef = (await this.git(repoPath, ['stash', 'list', '-n', '1', '--format=%gd'])).trim() || undefined; }
+        catch { /* ignore */ }
+      }
+      return { shelved, stashRef, unshelveConflicts };
+    }
+    if (dirty) {
+      stashRef = await this.stash(repoPath, `pull --no-rebase: ${tracking}`);
       shelved = !!stashRef || true;
     }
-    await this.git(repoPath, ['pull', useRebase ? '--rebase' : '--no-rebase', remote, remoteBranch]);
-    let unshelveConflicts: string[] = [];
+    await this.fetchAndMergeRemoteBranch(repoPath, remote, remoteBranch);
     if (shelved) {
       const un = await this.unshelve(repoPath);
       if (!un.ok) { unshelveConflicts = un.conflictFiles; }

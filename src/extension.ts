@@ -28,9 +28,11 @@ export async function activate(context: vscode.ExtensionContext) {
   };
 
   context.subscriptions.push(
+    { dispose: () => gitService.dispose() },
     vscode.workspace.registerTextDocumentContentProvider('idea-git-diff', new GitDiffContentProvider(gitService)),
     vscode.window.registerWebviewViewProvider(LogViewProvider.viewType, logProvider, { webviewOptions: { retainContextWhenHidden: true } }),
-    statusBar
+    statusBar,
+    vscode.commands.registerCommand('ideaGit.showGitCommandLog', () => gitService.showGitCommandLog())
   );
 
   async function init() {

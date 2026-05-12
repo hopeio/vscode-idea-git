@@ -176,6 +176,10 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         await vscode.commands.executeCommand('ideaGit.manageExcludedRepos');
         break;
       }
+      case 'opOpenScm': {
+        await this.focusSourceControlForConflicts();
+        break;
+      }
       case 'opRebaseContinue':
       case 'opRebaseSkip':
       case 'opRebaseAbort':
@@ -295,7 +299,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
           }
           if (res.unshelveConflicts.length > 0) {
             const open = await vscode.window.showWarningMessage(
-              `自动 Unshelve 冲突${res.stashRef ? `（${res.stashRef}）` : ''}，共 ${res.unshelveConflicts.length} 个文件。`,
+              `恢复本地未提交改动时冲突${res.stashRef ? `（${res.stashRef}）` : ''}，共 ${res.unshelveConflicts.length} 个路径（含子模块目录时多为指针与上游不一致，非「你改过该文件正文」）。`,
               '打开冲突文件'
             );
             if (open === '打开冲突文件') { await this.gitService.openConflictFiles(repo, res.unshelveConflicts); }
@@ -336,12 +340,16 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
             break;
           }
           case 'rebase':
-            await ensureTarget();
-            await this.gitService.rebaseBranch(repo, tracking);
+            try {
+              await ensureTarget();
+              await this.gitService.rebaseBranch(repo, tracking);
+            } catch (e: any) { await this.handleRebaseConflict(repo, e); }
             break;
           case 'merge':
-            await ensureTarget();
-            await this.gitService.mergeBranch(repo, tracking);
+            try {
+              await ensureTarget();
+              await this.gitService.mergeBranch(repo, tracking);
+            } catch (e: any) { await this.handleMergeConflict(repo, e); }
             break;
           case 'pullRebase':
             await ensureTarget();
@@ -398,12 +406,16 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
             break;
           }
           case 'rebase':
-            await ensureTarget();
-            await this.gitService.rebaseBranch(repo, tracking);
+            try {
+              await ensureTarget();
+              await this.gitService.rebaseBranch(repo, tracking);
+            } catch (e: any) { await this.handleRebaseConflict(repo, e); }
             break;
           case 'merge':
-            await ensureTarget();
-            await this.gitService.mergeBranch(repo, tracking);
+            try {
+              await ensureTarget();
+              await this.gitService.mergeBranch(repo, tracking);
+            } catch (e: any) { await this.handleMergeConflict(repo, e); }
             break;
           case 'pullRebase':
             await ensureTarget();
@@ -810,7 +822,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
     if (res.unshelveConflicts.length > 0) {
       const stashHint = res.stashRef ? `（已保留 ${res.stashRef}，可手动 git stash pop）` : '';
       const open = await vscode.window.showWarningMessage(
-        `Pull 已完成；自动 Unshelve 冲突 ${res.unshelveConflicts.length} 个文件${stashHint}。`,
+        `Pull 已完成；恢复本地未提交改动时冲突 ${res.unshelveConflicts.length} 个路径${stashHint}。`,
         '打开冲突文件'
       );
       if (open === '打开冲突文件') { await this.gitService.openConflictFiles(repo, res.unshelveConflicts); }
@@ -963,9 +975,9 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
     return repos.map((r, i) => ({ ...r, hasRemoteUpdates: flags[i] }));
   }
 
-  /** 检测是否处于 rebase / merge 中，附带分支/进度/冲突数，用于面板顶部横幅展示。 */
+  /** 检测 rebase / merge 进行中，以及「仅工作区未合并」（如 rebase 已完成但 autostash 恢复失败），供顶部横幅展示。 */
   private async detectInProgress(repo: string): Promise<{
-    rebase: boolean; merge: boolean; conflicts: number; repoName: string;
+    rebase: boolean; merge: boolean; conflicts: number; conflictOnly: boolean; repoName: string;
     head: string; onto: string; ontoName: string; otherRef: string; done: number; total: number;
   }> {
     const repoName = this.currentRepo?.name || '';
@@ -973,14 +985,19 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       this.gitService.isRebasing(repo).catch(() => false),
       this.gitService.isMerging(repo).catch(() => false),
     ]);
-    const base = { rebase, merge, conflicts: 0, repoName, head: '', onto: '', ontoName: '', otherRef: '', done: 0, total: 0 };
-    if (!rebase && !merge) { return base; }
-    try { base.conflicts = (await this.gitService.getConflictFiles(repo)).length; } catch { /* ignore */ }
-    try {
-      const info = await this.gitService.getOperationInfo(repo);
-      base.head = info.head; base.onto = info.onto; base.ontoName = info.ontoName;
-      base.otherRef = info.otherRef; base.done = info.done; base.total = info.total;
-    } catch { /* ignore */ }
+    let conflicts = 0;
+    try { conflicts = (await this.gitService.getConflictFiles(repo)).length; } catch { /* ignore */ }
+    const conflictOnly = conflicts > 0 && !rebase && !merge;
+    const base = { rebase, merge, conflicts, conflictOnly, repoName, head: '', onto: '', ontoName: '', otherRef: '', done: 0, total: 0 };
+    if (rebase || merge) {
+      try {
+        const info = await this.gitService.getOperationInfo(repo);
+        base.head = info.head; base.onto = info.onto; base.ontoName = info.ontoName;
+        base.otherRef = info.otherRef; base.done = info.done; base.total = info.total;
+      } catch { /* ignore */ }
+    } else if (conflictOnly) {
+      try { base.head = await this.gitService.getCurrentBranch(repo); } catch { /* ignore */ }
+    }
     return base;
   }
 
@@ -1326,8 +1343,22 @@ $('repoUpdateBadge').onclick=()=>{vscode.postMessage({type:'refreshRepos'});};
 $('repoExcludeBtn').onclick=()=>{vscode.postMessage({type:'manageExcludedRepos'});};
 function renderOpBanner(ip){
   const el=$('opBanner');if(!el)return;
-  if(!ip||(!ip.rebase&&!ip.merge)){el.className='op-banner';el.innerHTML='';return;}
+  if(!ip){el.className='op-banner';el.innerHTML='';return;}
   const isMerge=!!ip.merge,isRebase=!!ip.rebase;
+  const co=!!ip.conflictOnly||(ip.conflicts>0&&!isRebase&&!isMerge);
+  if(!isRebase&&!isMerge&&!co){el.className='op-banner';el.innerHTML='';return;}
+  if(co&&!isRebase&&!isMerge){
+    el.className='op-banner show';
+    const p=['<span class="op-label">工作区存在未合并冲突</span>'];
+    if(ip.repoName)p.push('<span class="op-meta">仓库: <b>'+eh(ip.repoName)+'</b></span>');
+    if(ip.head)p.push('<span class="op-meta">分支: <b>'+eh(ip.head)+'</b></span>');
+    if(ip.conflicts>0)p.push('<span class="op-conflicts">'+ip.conflicts+' 个路径</span>');
+    p.push('<span class="op-meta" style="opacity:.9">（无 Rebase/Merge 进行中时，多为恢复本地改动导致，请到源代码管理解决）</span>');
+    p.push('<div class="op-btns"><button data-op="opOpenScm">源代码管理</button></div>');
+    el.innerHTML=p.join('<span class="op-sep">·</span>');
+    el.querySelectorAll('button[data-op]').forEach(b=>{b.onclick=()=>vscode.postMessage({type:b.getAttribute('data-op')});});
+    return;
+  }
   el.className='op-banner show'+(isMerge&&!isRebase?' merge':'');
   const parts=[];
   parts.push('<span class="op-label">'+(isRebase?'Rebase':'Merge')+' in progress</span>');
