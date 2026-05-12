@@ -67,8 +67,19 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         const branches = await this.gitService.getBranches(repo);
         const currentBranch = await this.gitService.getCurrentBranch(repo);
         const tags = await this.gitService.getTags(repo);
+        const inProgress = await this.detectInProgress(repo);
         if (seqAtStart !== this.logStaleSeq) { return; }
-        this.postMessage({ type: 'logData', commits, branches, currentBranch, tags, append: !!msg.append, hasMore: commits.length >= maxCount, reqId: msg.reqId });
+        this.postMessage({
+          type: 'logData',
+          commits,
+          branches,
+          currentBranch,
+          tags,
+          append: !!msg.append,
+          hasMore: commits.length >= maxCount,
+          reqId: msg.reqId,
+          inProgress,
+        });
         break;
       }
       case 'selectCommit': {
@@ -506,9 +517,16 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'compareWithLocal': {
         try {
-          const cur = await this.gitService.getCurrentBranch(repo);
-          const files = await this.gitService.compareBranchFiles(repo, msg.hash, 'HEAD');
-          this.postMessage({ type: 'compareFiles', from: msg.hash, to: 'HEAD', fromLabel: msg.hash.slice(0, 9), toLabel: 'HEAD (' + cur + ')', files });
+          const files = await this.gitService.diffWithWorkTreeFiles(repo, msg.hash);
+          this.postMessage({
+            type: 'compareFiles',
+            from: msg.hash,
+            to: 'Working Tree',
+            fromLabel: msg.hash.slice(0, 9),
+            toLabel: 'Working Tree',
+            files,
+            diffMode: 'worktree',
+          });
         } catch (e: any) { vscode.window.showErrorMessage(`Compare 失败: ${e.message}`); }
         break;
       }
@@ -542,16 +560,15 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         void this.refreshCommitDetail(repo, msg.hash);
         break;
       }
-      case 'fixup': {
-        const terminal = vscode.window.createTerminal({ name: 'Git Fixup', cwd: repo });
-        terminal.sendText(`if git rev-parse --verify ${msg.hash}~2 >/dev/null 2>&1; then GIT_SEQUENCE_EDITOR="sed -i '' 's/^pick ${msg.hash} /fixup ${msg.hash} /'" git rebase -i ${msg.hash}~2; else GIT_SEQUENCE_EDITOR="sed -i '' 's/^pick ${msg.hash} /fixup ${msg.hash} /'" git rebase -i --root; fi`);
-        terminal.show();
-        break;
-      }
-      case 'squashInto': {
-        const terminal = vscode.window.createTerminal({ name: 'Git Squash Into', cwd: repo });
-        terminal.sendText(`if git rev-parse --verify ${msg.hash}~2 >/dev/null 2>&1; then GIT_SEQUENCE_EDITOR="sed -i '' 's/^pick ${msg.hash} /squash ${msg.hash} /'" git rebase -i ${msg.hash}~2; else GIT_SEQUENCE_EDITOR="sed -i '' 's/^pick ${msg.hash} /squash ${msg.hash} /'" git rebase -i --root; fi`);
-        terminal.show();
+      case 'mergeIntoPrevious': {
+        try {
+          await this.gitService.fixupCommitIntoParent(repo, msg.hash);
+          vscode.window.showInformationMessage(`Fixup into previous completed (${msg.hash.slice(0, 7)}; commit message discarded).`);
+          void this.refresh();
+        } catch (e: unknown) {
+          const t = e instanceof Error ? e.message : String(e);
+          vscode.window.showErrorMessage(`Fixup into previous failed: ${t}`);
+        }
         break;
       }
       case 'dropCommit': {
@@ -1290,7 +1307,7 @@ window.addEventListener('message',e=>{
     logHasMore=typeof m.hasMore==='boolean'?m.hasMore:(incoming.length>=LOG_PAGE_SIZE);
     logLoadingMore=false;
     if(m.repos)renderRepoSelect(m.repos,m.currentRepoPath);
-    renderOpBanner(m.inProgress||null);
+    if('inProgress' in m){renderOpBanner(m.inProgress||null);}
     const _sig=branchPanelSig();
     if(_sig!==lastBranchSig){lastBranchSig=_sig;renderBranches();}
     renderBranchFilter();renderAuthorList();renderFilterBar();renderLog(allCommits);
@@ -1729,8 +1746,7 @@ function ctxCommit(e,row){
     {icon:'\\u238C',label:'Revert Commit',action:()=>vscode.postMessage({type:'revert',hash})},
     {sep:1},
     {icon:'\\u270F',label:'Edit Commit Message...',action:()=>vscode.postMessage({type:'editMessage',hash,oldMessage:msg})},
-    {icon:'\\u{1F527}',label:'Fixup...',action:()=>vscode.postMessage({type:'fixup',hash})},
-    {icon:'\\u{1F4E5}',label:'Squash Into...',action:()=>vscode.postMessage({type:'squashInto',hash})},
+    {icon:'\\u{1F527}',label:'Fixup into previous',action:()=>vscode.postMessage({type:'mergeIntoPrevious',hash})},
     {icon:'\\u2716',label:'Drop Commit',action:()=>vscode.postMessage({type:'dropCommit',hash})},
     {icon:'\\u{1F680}',label:'Push All up to Here...',action:()=>vscode.postMessage({type:'pushUpTo',hash})},
     {sep:1},

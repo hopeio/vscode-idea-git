@@ -3,6 +3,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 
 const execFileAsync = promisify(execFile);
 
@@ -141,20 +142,10 @@ export class GitService implements vscode.Disposable {
     }
   }
 
-  /** 根目录与所属工作区文件夹一致时用文件夹名；嵌套仓库用「工作区名 › 相对路径」。 */
-  private makeRepoLabel(wsFolder: vscode.WorkspaceFolder, repoRoot: string, isSubmodule: boolean): string {
-    const suf = isSubmodule ? ' [submodule]' : '';
-    const folders = vscode.workspace.workspaceFolders;
-    if (!folders || folders.length <= 1) {
-      return path.basename(repoRoot) + suf;
-    }
-    const wf = path.normalize(wsFolder.uri.fsPath);
-    const rr = path.normalize(repoRoot);
-    if (rr === wf) { return `${wsFolder.name}${suf}`; }
-    let rel = '';
-    try { rel = path.relative(wsFolder.uri.fsPath, repoRoot).split(path.sep).join('/'); } catch { rel = ''; }
-    if (!rel || rel.startsWith('..')) { return `${wsFolder.name}: ${path.basename(repoRoot)}${suf}`; }
-    return `${wsFolder.name} › ${rel}${suf}`;
+  /** 展示名：仅仓库根目录名；子模块追加 [submodule]。重名由 dedupeRepoDisplayNames 用路径片段区分。 */
+  private makeRepoLabel(_wsFolder: vscode.WorkspaceFolder, repoRoot: string, isSubmodule: boolean): string {
+    const base = path.basename(repoRoot);
+    return isSubmodule ? `${base}[submodule]` : base;
   }
 
   private async findGitRoots(dir: string, depth: number, seen: Set<string>, wsFolder: vscode.WorkspaceFolder): Promise<void> {
@@ -198,9 +189,14 @@ export class GitService implements vscode.Disposable {
     } catch { /* no submodules or git error */ }
   }
 
-  private async git(repoPath: string, args: string[]): Promise<string> {
+  private async git(repoPath: string, args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
     this.maybeLogGitCommand(repoPath, args);
-    const { stdout } = await execFileAsync('git', ['-c', 'core.quotepath=false', ...args], { cwd: repoPath, maxBuffer: 50 * 1024 * 1024 });
+    const mergedEnv = env ? { ...process.env, ...env } : process.env;
+    const { stdout } = await execFileAsync('git', ['-c', 'core.quotepath=false', ...args], {
+      cwd: repoPath,
+      maxBuffer: 50 * 1024 * 1024,
+      env: mergedEnv,
+    });
     return stdout;
   }
 
@@ -1020,6 +1016,90 @@ export class GitService implements vscode.Disposable {
   async resolveCommitOid(repoPath: string, ref: string): Promise<string> {
     try { return (await this.git(repoPath, ['rev-parse', ref])).trim(); }
     catch { return ref; }
+  }
+
+  /** 短 oid，与 interactive rebase todo 里列出的 commit 形式一致（受 core.abbrev 影响）。 */
+  async revParseShort(repoPath: string, ref: string): Promise<string> {
+    try { return (await this.git(repoPath, ['rev-parse', '--short', ref])).trim(); }
+    catch { return ref.slice(0, 7); }
+  }
+
+  private shQuoteForSequenceEditor(s: string): string {
+    if (process.platform === 'win32') {
+      return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    }
+    return `'${s.replace(/'/g, `'\\''`)}'`;
+  }
+
+  /**
+   * 将指定提交在 interactive rebase 中从 pick 改为 fixup/squash（并入上一条），不经终端面板。
+   * 序列编辑器脚本对 todo 中每行 pick 的 oid 做 rev-parse 再比对，兼容 todo 里任意缩写长度。
+   */
+  async interactiveRebasePickAs(repoPath: string, commitOid: string, verb: 'fixup' | 'squash'): Promise<void> {
+    if (await this.isRebasing(repoPath)) {
+      throw new Error('当前已有进行中的 rebase，请先完成或中止。');
+    }
+    const full = (await this.git(repoPath, ['rev-parse', '--verify', `${commitOid}^{commit}`])).trim();
+    let rebaseArgs: string[];
+    try {
+      await this.git(repoPath, ['rev-parse', '--verify', `${full}~2`]);
+      rebaseArgs = ['rebase', '-i', `${full}~2`];
+    } catch {
+      rebaseArgs = ['rebase', '-i', '--root'];
+    }
+    const scriptPath = path.join(os.tmpdir(), `idea-git-seq-${process.pid}-${Date.now()}.cjs`);
+    const script = [
+      '\'use strict\';',
+      'const fs=require(\'fs\');',
+      'const {execFileSync}=require(\'child_process\');',
+      'const repo=process.env.IDEA_GIT_REPO;',
+      'const target=process.env.IDEA_GIT_TARGET_OID;',
+      'const verb=process.env.IDEA_GIT_SEQ_VERB||\'fixup\';',
+      'const todoPath=process.argv[process.argv.length-1];',
+      'function rev(r){try{return execFileSync(\'git\',[\'rev-parse\',\'--verify\',r+\'^{commit}\'],{cwd:repo,encoding:\'utf8\',stdio:[\'ignore\',\'pipe\',\'pipe\']}).trim();}catch(_){return \'\'}}',
+      'const tgt=rev(target);',
+      'if(!tgt){console.error(\'idea-git: invalid TARGET\');process.exit(1);}',
+      'const raw=fs.readFileSync(todoPath,\'utf8\');',
+      'const nl=raw.includes(String.fromCharCode(13,10))?String.fromCharCode(13,10):String.fromCharCode(10);',
+      'const lines=raw.split(/\\r?\\n/);',
+      'let changed=false;',
+      'const out=lines.map(line=>{',
+      'const m=line.match(/^pick\\s+(\\S+)(\\s.*)?$/i);',
+      'if(!m)return line;',
+      'if(rev(m[1])!==tgt)return line;',
+      'changed=true;',
+      'return verb+\' \'+m[1]+(m[2]||\'\');',
+      '});',
+      'if(!changed){console.error(\'idea-git: pick line not found for target commit\');process.exit(1);}',
+      'fs.writeFileSync(todoPath,out.join(nl));',
+    ].join('');
+    await fs.promises.writeFile(scriptPath, script, 'utf8');
+    const GIT_SEQUENCE_EDITOR = `${this.shQuoteForSequenceEditor(process.execPath)} ${this.shQuoteForSequenceEditor(scriptPath)}`;
+    const mergedEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      GIT_SEQUENCE_EDITOR,
+      IDEA_GIT_REPO: repoPath,
+      IDEA_GIT_TARGET_OID: full,
+      IDEA_GIT_SEQ_VERB: verb,
+    };
+    this.maybeLogGitCommand(repoPath, rebaseArgs);
+    const gitArgv = verb === 'fixup'
+      ? ['-c', 'core.quotepath=false', '-c', 'core.editor=true', ...rebaseArgs]
+      : ['-c', 'core.quotepath=false', ...rebaseArgs];
+    try {
+      try {
+        await execFileAsync('git', gitArgv, { cwd: repoPath, maxBuffer: 50 * 1024 * 1024, env: mergedEnv });
+      } catch (e) {
+        const msg = this.gitErrText(e).trim() || (e instanceof Error ? e.message : String(e));
+        throw new Error(msg || 'git rebase 失败');
+      }
+    } finally {
+      try { await fs.promises.unlink(scriptPath); } catch { /* ignore */ }
+    }
+  }
+
+  async fixupCommitIntoParent(repoPath: string, commitOid: string): Promise<void> {
+    await this.interactiveRebasePickAs(repoPath, commitOid, 'fixup');
   }
 
   /** 仅当存在「本地分支 + 已配置 upstream + 落后于 upstream」时视为有远端可拉更新（不含纯远端新分支等）。 */

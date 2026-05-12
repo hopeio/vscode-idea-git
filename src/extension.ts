@@ -153,7 +153,10 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('ideaGit.selectRepo', async () => {
       const repos = gitService.getRepos();
       if (repos.length <= 1) { return; }
-      const pick = await vscode.window.showQuickPick(repos.map(r => ({ label: r.name, description: r.rootPath, repo: r })), { placeHolder: '选择仓库' });
+      const pick = await vscode.window.showQuickPick(
+        repos.map(r => ({ label: r.name, description: r.rootPath, repo: r })),
+        { placeHolder: '选择仓库' }
+      );
       if (!pick) { return; }
       selectRepo(pick.repo);
       await statusBar.refresh();
