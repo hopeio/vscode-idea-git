@@ -1,12 +1,11 @@
 ---
 description: IDEA Git 扩展改动后自动打 VSIX
-globs: vscode-idea-git/**/*
+globs: src/**, package.json, tsconfig.json
 alwaysApply: false
 ---
-
 # vscode-idea-git 改动后打包
 
-凡编辑、新增或删除 `vscode-idea-git/` 下任意源码或 `package.json` 后，在结束回复前**必须**执行
+凡编辑、新增或删除任意源码或 `package.json` 后，在结束回复前**必须**执行
 
 ```bash
 npm run vsce:package

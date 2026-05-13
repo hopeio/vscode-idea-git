@@ -7,6 +7,11 @@ import * as os from 'os';
 
 const execFileAsync = promisify(execFile);
 
+export interface GitLogAuthor {
+  name: string;
+  lastAt: number;
+}
+
 export interface GitRepo {
   name: string;
   rootPath: string;
@@ -407,6 +412,25 @@ export class GitService implements vscode.Disposable {
 
   async unshelve(repoPath: string): Promise<{ ok: boolean; conflictFiles: string[] }> {
     return this.stashPop(repoPath);
+  }
+
+  async getLogAuthors(repoPath: string): Promise<GitLogAuthor[]> {
+    try {
+      const out = await this.git(repoPath, ['log', '--all', '--format=%aN%x09%at']);
+      const seen = new Map<string, number>();
+      for (const line of out.trim().split('\n')) {
+        if (!line) { continue; }
+        const tab = line.lastIndexOf('\t');
+        if (tab <= 0) { continue; }
+        const name = line.slice(0, tab).trim();
+        if (!name || seen.has(name)) { continue; }
+        const ts = parseInt(line.slice(tab + 1), 10);
+        seen.set(name, Number.isFinite(ts) ? ts : 0);
+      }
+      return [...seen.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .map(([name, lastAt]) => ({ name, lastAt }));
+    } catch { return []; }
   }
 
   async getLog(repoPath: string, opts: { maxCount?: number; skip?: number; branch?: string; author?: string; authorPatterns?: string[]; after?: string; before?: string; path?: string } = {}): Promise<GitCommit[]> {
