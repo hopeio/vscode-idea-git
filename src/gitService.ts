@@ -433,6 +433,14 @@ export class GitService implements vscode.Disposable {
     } catch { return []; }
   }
 
+  private gitLogSinceArg(date: string): string {
+    return /^\d{4}-\d{2}-\d{2}$/.test(date) ? `${date} 00:00:00` : date;
+  }
+
+  private gitLogUntilArg(date: string): string {
+    return /^\d{4}-\d{2}-\d{2}$/.test(date) ? `${date} 23:59:59` : date;
+  }
+
   async getLog(repoPath: string, opts: { maxCount?: number; skip?: number; branch?: string; author?: string; authorPatterns?: string[]; after?: string; before?: string; path?: string } = {}): Promise<GitCommit[]> {
     const SEP = '\x1e';
     const REC = '\x1f';
@@ -444,8 +452,8 @@ export class GitService implements vscode.Disposable {
     if (opts.authorPatterns?.length) {
       for (const p of opts.authorPatterns) { args.push(`--author=${p}`); }
     } else if (opts.author) { args.push(`--author=${opts.author}`); }
-    if (opts.after) { args.push(`--after=${opts.after}`); }
-    if (opts.before) { args.push(`--before=${opts.before}`); }
+    if (opts.after) { args.push(`--since=${this.gitLogSinceArg(opts.after)}`); }
+    if (opts.before) { args.push(`--until=${this.gitLogUntilArg(opts.before)}`); }
     if (!opts.branch) { args.push('--all'); }
     if (opts.path) { args.push('--', opts.path); }
     let out: string;
@@ -523,20 +531,10 @@ export class GitService implements vscode.Disposable {
     await this.git(repoPath, ['revert', hash, '--no-edit']);
   }
 
-  /**
-   * 选 diff 左侧 parent：非 merge 直接用 parents[0]；merge 时按 parent 顺序找
-   * 第一个对该文件实际有差异的 parent，避免 parents[0]..merge 对该文件为空 diff。
-   */
+  /** 选 diff 左侧 parent：merge 与普通提交均用第一 parent。 */
   private async pickDiffParentForFile(repoPath: string, hash: string, filePath: string): Promise<string> {
     const parents = await this.getCommitParents(repoPath, hash);
     if (parents.length === 0) { return `${hash}~1`; }
-    if (parents.length === 1) { return parents[0]; }
-    for (const parent of parents) {
-      try {
-        const out = await this.git(repoPath, ['diff', '--name-only', parent, hash, '--', filePath]);
-        if (out.trim()) { return parent; }
-      } catch { /* ignore */ }
-    }
     return parents[0];
   }
 
@@ -593,17 +591,11 @@ export class GitService implements vscode.Disposable {
     terminal.show();
   }
 
-  async getFileHistoryPage(repoPath: string, filePath: string, uptoHash: string, skip: number, limit: number): Promise<{ commits: GitCommit[]; hasMore: boolean }> {
-    const SEP = '\x1e';
-    const format = ['%H', '%h', '%an', '%aE', '%cn', '%cE', '%aI', '%at', '%s', '%P', '%D'].join(SEP);
-    const refArg = uptoHash ? uptoHash : '--all';
-    const args = ['log', '--full-history', `--format=${format}`, '--decorate=short', '-n', String(limit), '--skip', String(skip), refArg, '--', filePath];
-    let out: string;
-    try { out = await this.git(repoPath, args); } catch { return { commits: [], hasMore: false }; }
+  private parseHistoryLogOutput(out: string, sep: string): GitCommit[] {
     const commits: GitCommit[] = [];
     for (const line of out.trim().split('\n')) {
       if (!line) { continue; }
-      const parts = line.split(SEP);
+      const parts = line.split(sep);
       if (parts.length < 11) { continue; }
       const refs = parts[10] ? parts[10].split(',').map(r => r.trim()).filter(Boolean) : [];
       commits.push({
@@ -612,22 +604,30 @@ export class GitService implements vscode.Disposable {
         parents: parts[9] ? parts[9].split(' ').filter(Boolean) : [], refs
       });
     }
-    return { commits, hasMore: commits.length === limit };
+    return commits;
+  }
+
+  async getFileHistoryPage(repoPath: string, filePath: string, uptoHash: string, rawSkip: number, limit: number): Promise<{ commits: GitCommit[]; hasMore: boolean; nextRawSkip: number }> {
+    const SEP = '\x1e';
+    const format = ['%H', '%h', '%an', '%aE', '%cn', '%cE', '%aI', '%at', '%s', '%P', '%D'].join(SEP);
+    const refArg = uptoHash || (await this.getCurrentBranch(repoPath)) || 'HEAD';
+    const args = ['log', '--full-history', '--simplify-merges', '-M', `--format=${format}`, '--decorate=short', '-n', String(limit), '--skip', String(rawSkip), refArg, '--', filePath];
+    let out = '';
+    try { out = await this.git(repoPath, args); } catch { return { commits: [], hasMore: false, nextRawSkip: rawSkip }; }
+    const commits = this.parseHistoryLogOutput(out, SEP);
+    return { commits, hasMore: commits.length === limit, nextRawSkip: rawSkip + commits.length };
   }
 
   async getFilePatchAtCommit(repoPath: string, hash: string, filePath: string): Promise<string> {
     try {
-      const direct = await this.git(repoPath, ['show', '--patch', '--stat', '--pretty=fuller', hash, '--', filePath]);
-      if (direct.trim()) { return direct; }
       const parents = await this.getCommitParents(repoPath, hash);
-      for (const parent of parents) {
+      if (parents.length >= 2) {
+        const parent = parents[0];
         const merged = await this.git(repoPath, ['diff', '--patch', '--stat', parent, hash, '--', filePath]);
-        if (merged.trim()) {
-          const header = await this.git(repoPath, ['show', '--no-patch', '--pretty=fuller', hash]);
-          return `${header}\n\n# Diff to parent ${parent.slice(0, 7)}\n${merged}`;
-        }
+        const header = await this.git(repoPath, ['show', '--no-patch', '--pretty=fuller', hash]);
+        return merged.trim() ? `${header}\n\n# Diff to parent ${parent.slice(0, 7)}\n${merged}` : header;
       }
-      return direct;
+      return await this.git(repoPath, ['show', '--patch', '--stat', '--pretty=fuller', hash, '--', filePath]);
     } catch {
       return '';
     }

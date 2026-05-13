@@ -637,21 +637,21 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
     return { hash: c.hash, abbrevHash: c.abbrevHash, author: c.author, date: c.date, message: c.message };
   }
 
-  /** 首屏 + 为定位 focusHash 必要时预取多页；nextSkip 为已消费的 git --skip 游标 */
+  /** 首屏 + 为定位 focusHash 必要时预取多页；nextRawSkip 为 git log --skip 游标 */
   private async loadFileHistoryInitialRows(repo: string, filePath: string, uptoHash: string, focusHash: string | undefined): Promise<{
-    rows: ReturnType<typeof LogViewProvider.fileHistoryRowLite>[]; nextSkip: number; hasMore: boolean;
+    rows: ReturnType<typeof LogViewProvider.fileHistoryRowLite>[]; nextRawSkip: number; hasMore: boolean;
   }> {
     const PAGE = LogViewProvider.FILE_HISTORY_PAGE_SIZE;
     const dedupe = (arr: GitCommit[]) => {
       const s = new Set<string>();
       return arr.filter((c) => (s.has(c.hash) ? false : (s.add(c.hash), true)));
     };
-    let rawSkip = 0;
+    let nextRawSkip = 0;
     let merged: GitCommit[] = [];
     let hasMore = true;
     const pull = async () => {
-      const p = await this.gitService.getFileHistoryPage(repo, filePath, uptoHash, rawSkip, PAGE);
-      rawSkip += p.commits.length;
+      const p = await this.gitService.getFileHistoryPage(repo, filePath, uptoHash, nextRawSkip, PAGE);
+      nextRawSkip = p.nextRawSkip;
       hasMore = p.hasMore;
       merged = dedupe([...merged, ...p.commits]);
     };
@@ -661,7 +661,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         await pull();
       }
     }
-    return { rows: merged.map(LogViewProvider.fileHistoryRowLite), nextSkip: rawSkip, hasMore };
+    return { rows: merged.map(LogViewProvider.fileHistoryRowLite), nextRawSkip, hasMore };
   }
 
   async openFileHistoryTabWithNativeDiff(repo: string, filePath: string, uptoHash: string = '', focusHash?: string) {
@@ -671,14 +671,13 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const initialHash = (focusHash && init.rows.some((r) => r.hash === focusHash)) ? focusHash : init.rows[0].hash;
-    const firstPatch = await this.gitService.getFilePatchAtCommit(repo, initialHash, filePath);
     const panel = vscode.window.createWebviewPanel(
       'ideaGit.fileHistory.nativeDiff',
       `File History: ${path.basename(filePath)}`,
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true }
     );
-    let nextSkip = init.nextSkip;
+    let nextRawSkip = init.nextRawSkip;
     let hasMore = init.hasMore;
     let loadMoreInFlight = false;
     const items = JSON.stringify(init.rows);
@@ -737,18 +736,21 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
           pEl.querySelectorAll('.ctx').forEach(el=>{el.onclick=()=>{ctxOpen.add(Number(el.dataset.b));renderPatch(p);};});
         }
         left.innerHTML=commits.map(rowHtml).join('');
-        renderPatch(${JSON.stringify(firstPatch)});
+        renderPatch('');
         function tryAutoLoadMore(){if(!hasMore||loadingMore)return;if(left.scrollHeight<=left.clientHeight+8){loadingMore=true;if(histFoot)histFoot.textContent='加载中…';vscode.postMessage({type:'fileHistoryLoadMore'});}}
         bindScroll();updateFoot();scrollSel();requestAnimationFrame(()=>requestAnimationFrame(tryAutoLoadMore));
         window.addEventListener('message',e=>{const m=e.data;if(m.type==='historyCommitsAppend'){const seen=new Set(commits.map(x=>x.hash));for(const c of(m.commits||[])){if(seen.has(c.hash))continue;seen.add(c.hash);commits.push(c);left.insertAdjacentHTML('beforeend',rowHtml(c));}hasMore=!!m.hasMore;loadingMore=false;updateFoot();tryAutoLoadMore();return;}if(m.type==='historyPatch'){renderPatch(m.patch||'');setSel(m.hash||currentSel);scrollSel();}});
       </script></body></html>`;
+    void this.gitService.getFilePatchAtCommit(repo, initialHash, filePath).then((patch) => {
+      panel.webview.postMessage({ type: 'historyPatch', hash: initialHash, patch });
+    });
     panel.webview.onDidReceiveMessage(async (msg) => {
       if (msg.type === 'fileHistoryLoadMore') {
         if (loadMoreInFlight || !hasMore) { return; }
         loadMoreInFlight = true;
         try {
-          const page = await this.gitService.getFileHistoryPage(repo, filePath, uptoHash, nextSkip, LogViewProvider.FILE_HISTORY_PAGE_SIZE);
-          nextSkip += page.commits.length;
+          const page = await this.gitService.getFileHistoryPage(repo, filePath, uptoHash, nextRawSkip, LogViewProvider.FILE_HISTORY_PAGE_SIZE);
+          nextRawSkip = page.nextRawSkip;
           hasMore = page.hasMore;
           panel.webview.postMessage({ type: 'historyCommitsAppend', commits: page.commits.map(LogViewProvider.fileHistoryRowLite), hasMore });
         } catch {
