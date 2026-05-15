@@ -675,8 +675,18 @@ export class GitService implements vscode.Disposable {
     await this.git(repoPath, ['merge', branch]);
   }
 
-  async rebaseBranch(repoPath: string, onto: string): Promise<void> {
-    await this.git(repoPath, ['rebase', onto]);
+  /** 有未提交改动时使用 `rebase --autostash`，完成后自动恢复工作区（等同 Shelve → Rebase → Unshelve）。 */
+  async rebaseBranch(repoPath: string, onto: string): Promise<{ shelved: boolean; unshelveConflicts: string[]; stashRef?: string }> {
+    const dirty = await this.hasUncommittedChanges(repoPath);
+    if (dirty) { await this.git(repoPath, ['rebase', '--autostash', onto]); }
+    else { await this.git(repoPath, ['rebase', onto]); }
+    const unshelveConflicts = await this.getConflictFiles(repoPath);
+    let stashRef: string | undefined;
+    if (dirty && unshelveConflicts.length > 0) {
+      try { stashRef = (await this.git(repoPath, ['stash', 'list', '-n', '1', '--format=%gd'])).trim() || undefined; }
+      catch { /* ignore */ }
+    }
+    return { shelved: dirty, unshelveConflicts, stashRef };
   }
 
   /** 解析仓库的真实 git dir，兼容 submodule 中 `.git` 是文件的情况 */

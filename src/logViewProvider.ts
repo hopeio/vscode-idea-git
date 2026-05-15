@@ -233,8 +233,10 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         const curDisplay = await this.gitService.getCurrentBranch(repo);
         const result = await this.gitService.smartCheckout(repo, msg.branch);
         try {
-          await this.gitService.rebaseBranch(repo, ontoRef);
-          await this.tryAutoUnshelve(repo, result, `已 Checkout ${msg.branch} 并 Rebase onto ${ontoRef}（原在 ${curDisplay}）`);
+          const successMsg = `已 Checkout ${msg.branch} 并 Rebase onto ${ontoRef}（原在 ${curDisplay}）`;
+          const rebaseRes = await this.gitService.rebaseBranch(repo, ontoRef);
+          if (result.shelved) { await this.tryAutoUnshelve(repo, result, successMsg); }
+          else { await this.finishWithAutoStash(repo, rebaseRes, successMsg); }
         } catch (e: any) { await this.handleRebaseConflict(repo, e); }
         await this.refresh();
         break;
@@ -271,8 +273,8 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
           if (go !== '仍要继续') { await this.refresh(); break; }
         }
         try {
-          await this.gitService.rebaseBranch(repo, msg.branch);
-          vscode.window.showInformationMessage(`已 Rebase ${curDisplay} onto ${msg.branch}`);
+          const rebaseRes = await this.gitService.rebaseBranch(repo, msg.branch);
+          await this.finishWithAutoStash(repo, rebaseRes, `已 Rebase ${curDisplay} onto ${msg.branch}`);
         } catch (e: any) {
           await this.handleRebaseConflict(repo, e);
         }
@@ -358,7 +360,8 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
           case 'rebase':
             try {
               await ensureTarget();
-              await this.gitService.rebaseBranch(repo, tracking);
+              const rebaseRes = await this.gitService.rebaseBranch(repo, tracking);
+              await this.finishWithAutoStash(repo, rebaseRes, `已 Rebase '${targetBranch}' onto '${tracking}'`);
             } catch (e: any) { await this.handleRebaseConflict(repo, e); }
             break;
           case 'merge':
@@ -424,7 +427,8 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
           case 'rebase':
             try {
               await ensureTarget();
-              await this.gitService.rebaseBranch(repo, tracking);
+              const rebaseRes = await this.gitService.rebaseBranch(repo, tracking);
+              await this.finishWithAutoStash(repo, rebaseRes, `已 Rebase '${targetBranch}' onto '${tracking}'`);
             } catch (e: any) { await this.handleRebaseConflict(repo, e); }
             break;
           case 'merge':
@@ -841,20 +845,27 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
     try { await vscode.commands.executeCommand('workbench.view.scm'); } catch { /* ignore */ }
   }
 
-  /** pullFromTracking 结束后展示通用提示，含 unshelve 冲突提醒。 */
-  private async notifyPullResult(repo: string, res: { shelved: boolean; stashRef?: string; unshelveConflicts: string[] }): Promise<void> {
+  /** 操作结束后展示提示；若曾 autostash，说明是否已自动 Unshelve 及冲突。 */
+  private async finishWithAutoStash(
+    repo: string, res: { shelved: boolean; stashRef?: string; unshelveConflicts: string[] }, successMsg: string
+  ): Promise<void> {
     if (res.unshelveConflicts.length > 0) {
       const stashHint = res.stashRef ? `（已保留 ${res.stashRef}，可手动 git stash pop）` : '';
       const open = await vscode.window.showWarningMessage(
-        `Pull 已完成；恢复本地未提交改动时冲突 ${res.unshelveConflicts.length} 个路径${stashHint}。`,
+        `${successMsg}；恢复本地未提交改动时冲突 ${res.unshelveConflicts.length} 个路径${stashHint}。`,
         '打开冲突文件'
       );
       if (open === '打开冲突文件') { await this.gitService.openConflictFiles(repo, res.unshelveConflicts); }
     } else if (res.shelved) {
-      vscode.window.showInformationMessage(`Pull 已完成；已自动恢复 Shelve 的改动${res.stashRef ? `（${res.stashRef}）` : ''}`);
+      vscode.window.showInformationMessage(`${successMsg}；已自动恢复 Shelve 的改动${res.stashRef ? `（${res.stashRef}）` : ''}`);
     } else {
-      vscode.window.showInformationMessage('Pull 已完成');
+      vscode.window.showInformationMessage(successMsg);
     }
+  }
+
+  /** pullFromTracking 结束后展示通用提示，含 unshelve 冲突提醒。 */
+  private async notifyPullResult(repo: string, res: { shelved: boolean; stashRef?: string; unshelveConflicts: string[] }): Promise<void> {
+    await this.finishWithAutoStash(repo, res, 'Pull 已完成');
   }
 
   /** 切分支后若产生 Shelve（stash），自动尝试 Unshelve；冲突时引导到源代码管理。 */
