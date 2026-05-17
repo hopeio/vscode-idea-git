@@ -195,6 +195,22 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         await this.focusSourceControlForConflicts();
         break;
       }
+      case 'opAcceptOurs':
+      case 'opAcceptTheirs': {
+        const side = msg.type === 'opAcceptOurs' ? 'ours' : 'theirs';
+        try {
+          const n = await this.gitService.acceptConflictSide(repo, side);
+          if (n > 0) {
+            vscode.window.showInformationMessage(`已接受 ${side} 并标记解决 ${n} 个冲突路径`);
+          } else {
+            vscode.window.showInformationMessage('当前无未合并冲突');
+          }
+        } catch (e: any) {
+          vscode.window.showErrorMessage(`接受 ${side} 失败: ${e?.message || e}`);
+        }
+        await this.refresh();
+        break;
+      }
       case 'opRebaseContinue':
       case 'opRebaseSkip':
       case 'opRebaseAbort':
@@ -1471,7 +1487,9 @@ function renderOpBanner(ip){
     if(ip.head)p.push('<span class="op-meta">分支: <b>'+eh(ip.head)+'</b></span>');
     if(ip.conflicts>0)p.push('<span class="op-conflicts">'+ip.conflicts+' 个路径</span>');
     p.push('<span class="op-meta" style="opacity:.9">（无 Rebase/Merge 进行中时，多为恢复本地改动导致，请到源代码管理解决）</span>');
-    p.push('<div class="op-btns"><button data-op="opOpenScm">源代码管理</button></div>');
+    let coBtns='<button data-op="opOpenScm">源代码管理</button>';
+    if(ip.conflicts>0){coBtns='<button data-op="opAcceptOurs">Ours</button><button data-op="opAcceptTheirs">Theirs</button>'+coBtns;}
+    p.push('<div class="op-btns">'+coBtns+'</div>');
     el.innerHTML=p.join('<span class="op-sep">·</span>');
     el.querySelectorAll('button[data-op]').forEach(b=>{b.onclick=()=>vscode.postMessage({type:b.getAttribute('data-op')});});
     return;
@@ -1492,9 +1510,10 @@ function renderOpBanner(ip){
   parts.push(ip.conflicts>0
     ?'<span class="op-conflicts">'+ip.conflicts+' 个冲突待解决</span>'
     :'<span style="opacity:.85">无未解决冲突</span>');
-  const btns=isRebase
+  let btns=isRebase
     ?'<button data-op="opRebaseContinue">Continue</button><button data-op="opRebaseSkip">Skip</button><button class="danger" data-op="opRebaseAbort">Abort</button>'
     :'<button data-op="opMergeContinue">Commit</button><button class="danger" data-op="opMergeAbort">Abort</button>';
+  if(ip.conflicts>0){btns='<button data-op="opAcceptOurs">Ours</button><button data-op="opAcceptTheirs">Theirs</button>'+btns;}
   el.innerHTML=parts.join('<span class="op-sep">·</span>')+'<div class="op-btns">'+btns+'</div>';
   el.querySelectorAll('button[data-op]').forEach(b=>{
     b.onclick=()=>{const op=b.getAttribute('data-op');if(op)vscode.postMessage({type:op});};

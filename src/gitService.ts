@@ -800,6 +800,32 @@ export class GitService implements vscode.Disposable {
     await this.git(repoPath, ['merge', '--abort']);
   }
 
+  /** 未合并路径（含 submodule gitlink），比 diff-filter=U 更完整。 */
+  private async listUnmergedPaths(repoPath: string): Promise<string[]> {
+    try {
+      const out = await this.git(repoPath, ['ls-files', '-u']);
+      const paths = new Set<string>();
+      for (const line of out.trim().split('\n')) {
+        if (!line) { continue; }
+        const tab = line.lastIndexOf('\t');
+        if (tab < 0) { continue; }
+        paths.add(line.slice(tab + 1));
+      }
+      return [...paths];
+    } catch { return []; }
+  }
+
+  /** 将全部未合并路径置为 --ours 或 --theirs（含 submodule gitlink），再 add。 */
+  async acceptConflictSide(repoPath: string, side: 'ours' | 'theirs'): Promise<number> {
+    const files = await this.listUnmergedPaths(repoPath);
+    if (!files.length) { return 0; }
+    for (const f of files) {
+      await this.git(repoPath, ['checkout', `--${side}`, '--', f]);
+      await this.git(repoPath, ['add', '--', f]);
+    }
+    return files.length;
+  }
+
   /**
    * 为父仓里被改动的子模块拉取最新对象（解决 `Could not read <oid>` 类问题）。
    * 先 sync 配置 → init 缺失子模块 → 在每个子模块里 `git fetch --all`。
