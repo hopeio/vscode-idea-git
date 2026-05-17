@@ -295,13 +295,20 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       case 'mergeCurrentInto': {
         const mergeFromRef = await this.gitService.getHeadAsRefForGit(repo);
         const curDisplay = await this.gitService.getCurrentBranch(repo);
-        let switched: { shelved: boolean; forced: boolean; stashRef?: string } = { shelved: false, forced: false };
+        let switched: { shelved: boolean; forced: boolean; stashRef?: string };
         try {
           switched = await this.gitService.smartCheckout(repo, msg.branch);
-          await this.gitService.mergeBranch(repo, mergeFromRef);
-          await this.tryAutoUnshelve(repo, switched, `已 Merge ${mergeFromRef}（原 ${curDisplay}）into ${msg.branch}`);
         } catch (e: any) {
           if (e?.message?.includes('用户取消')) { break; }
+          vscode.window.showErrorMessage(`切换分支失败: ${e?.message || e}`);
+          break;
+        }
+        const successMsg = `已 Merge ${mergeFromRef}（原 ${curDisplay}）into ${msg.branch}`;
+        try {
+          await this.gitService.mergeBranch(repo, mergeFromRef);
+          if (switched.shelved) { await this.tryAutoUnshelve(repo, switched, successMsg); }
+          else { vscode.window.showInformationMessage(successMsg); }
+        } catch (e: any) {
           await this.handleMergeConflict(repo, e);
         }
         await this.refresh();
@@ -939,7 +946,13 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
 
   private async handleMergeConflict(repo: string, error: any): Promise<void> {
     if (!(await this.gitService.isMerging(repo))) {
-      vscode.window.showErrorMessage(`Merge 失败: ${error?.message || error}`);
+      if (await this.gitService.isRebasing(repo)) {
+        vscode.window.showErrorMessage(
+          `Merge 未完成: ${error?.message || error}。当前仓库仍在 Rebase 中，请先在日志顶栏完成或 Abort Rebase，再执行 Merge。`
+        );
+      } else {
+        vscode.window.showErrorMessage(`Merge 失败: ${error?.message || error}`);
+      }
       return;
     }
     let lastAutoCommitFailed = false;
@@ -1678,6 +1691,7 @@ function bindBI(el){
     const tracking=el.dataset.tracking;
     const items=[];
     items.push({icon:'\\u21AA',label:'Checkout',action:()=>vscode.postMessage({type:'checkoutBranch',branch:br})});
+    items.push({icon:'\\u{1F4CB}',label:'Copy Branch Name',action:()=>{navigator.clipboard.writeText(br);}});
     items.push({icon:'\\u2B07',label:'Update',action:()=>vscode.postMessage({type:'pullBranch',branch:br})});
     items.push({icon:'\\u{1F680}',label:'Push...',action:()=>vscode.postMessage({type:'pushBranch',branch:br,setUpstream:true})});
     items.push({icon:'\\u{1F33F}',label:'New Branch from \\''+br+'\\'...',action:()=>vscode.postMessage({type:'newBranchFrom',branch:br})});
@@ -1840,13 +1854,28 @@ function ctxCommit(e,row){
 $('fpTree').onclick=()=>{filesViewMode='tree';$('fpTree').classList.add('active');$('fpFlat').classList.remove('active');renderFiles(currentFiles,currentFilesHash);};
 $('fpFlat').onclick=()=>{filesViewMode='flat';$('fpFlat').classList.add('active');$('fpTree').classList.remove('active');renderFiles(currentFiles,currentFilesHash);};
 
+function mergeGroupsFileCount(mg){
+  if(!mg)return 0;
+  let n=(mg.combined&&mg.combined.length)||0;
+  if(mg.parentDiffs){for(const pd of mg.parentDiffs)n+=(pd.files&&pd.files.length)||0;}
+  return n;
+}
 function renderFiles(files,hash){
   const l=$('filesList'),det=$('commitDetail');
-  $('fpTitle').textContent=files&&files.length?'Changed ('+files.length+')':'Changed';
-  if(!files||!files.length){l.innerHTML='<div style="padding:10px;color:var(--desc)">No changed files</div>';det.classList.add('hidden');$('fpResize').classList.add('hidden');return;}
+  const mg=currentMergeGroups;
+  const flatLen=files&&files.length?files.length:0;
+  const mgCount=mergeGroupsFileCount(mg);
+  const total=flatLen||mgCount;
+  $('fpTitle').textContent=total?'Changed ('+total+')':'Changed';
+  if(!flatLen&&!mgCount){
+    l.innerHTML='<div style="padding:10px;color:var(--desc)">No changed files</div>';
+    if(currentDetail){det.classList.remove('hidden');$('fpResize').classList.remove('hidden');}
+    else{det.classList.add('hidden');$('fpResize').classList.add('hidden');}
+    return;
+  }
+  const useMergeLayout=!!(mg&&((mg.combined&&mg.combined.length)||(!flatLen&&mg.parentDiffs&&mg.parentDiffs.some(pd=>pd.files&&pd.files.length))));
   let h='';
-  if(currentMergeGroups){
-    const mg=currentMergeGroups;
+  if(useMergeLayout){
     if(mg.combined&&mg.combined.length>0){
       h+='<div class="fp-group"><span>\\u25BC Merge result</span><span class="cnt">'+mg.combined.length+' files</span></div>';
       h+='<div class="fp-group-ch">';
@@ -1855,13 +1884,15 @@ function renderFiles(files,hash){
     }
     if(mg.parentDiffs){
       for(const pd of mg.parentDiffs){
-        h+='<div class="fp-group"><span>\\u25B6 Changes to '+eh(pd.abbrev)+' '+eh(pd.message.slice(0,50))+'</span><span class="cnt">'+pd.files.length+' files</span></div>';
-        h+='<div class="fp-group-ch" style="display:none">';
+        if(!pd.files||!pd.files.length)continue;
+        const only=mgCount===pd.files.length&&!mg.combined?.length;
+        h+='<div class="fp-group"><span>'+(only?'\\u25BC':'\\u25B6')+' Changes to '+eh(pd.abbrev)+' '+eh(pd.message.slice(0,50))+'</span><span class="cnt">'+pd.files.length+' files</span></div>';
+        h+='<div class="fp-group-ch" style="display:'+(only?'':'none')+'">';
         h+=(filesViewMode==='tree'?buildFTree(pd.files,hash,pd.parentHash):buildFFlat(pd.files,hash,pd.parentHash));
         h+='</div>';
       }
     }
-  }else{
+  }else if(flatLen){
     h+=(filesViewMode==='tree'?buildFTree(files,hash):buildFFlat(files,hash));
   }
   l.innerHTML=h;

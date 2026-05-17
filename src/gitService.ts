@@ -477,7 +477,24 @@ export class GitService implements vscode.Disposable {
     try {
       const parents = await this.getCommitParents(repoPath, hash);
       if (parents.length > 1) {
-        return this.parseDiffOutput(await this.git(repoPath, ['diff-tree', '-r', '--no-commit-id', '--name-status', '-M', parents[0], hash]));
+        const vsFirst = this.parseDiffOutput(
+          await this.git(repoPath, ['diff-tree', '-r', '--no-commit-id', '--name-status', '-M', parents[0], hash])
+        );
+        if (vsFirst.length > 0) { return vsFirst; }
+        // 合并结果与第一 parent 树相同（如 dev 已含改动再 merge origin/dev）时，相对第一 parent 为空，需汇总各 parent 差异
+        const seen = new Set<string>();
+        const union: GitFileChange[] = [];
+        for (const ph of parents) {
+          const part = this.parseDiffOutput(
+            await this.git(repoPath, ['diff-tree', '-r', '--no-commit-id', '--name-status', '-M', ph, hash])
+          );
+          for (const f of part) {
+            if (seen.has(f.path)) { continue; }
+            seen.add(f.path);
+            union.push(f);
+          }
+        }
+        return union;
       }
       return this.parseDiffOutput(await this.git(repoPath, ['diff-tree', '--no-commit-id', '-r', '--name-status', '-M', hash]));
     } catch {
@@ -701,17 +718,22 @@ export class GitService implements vscode.Disposable {
     try { await fs.promises.stat(p); return true; } catch { return false; }
   }
 
+  /** 以 REBASE_HEAD / rebase-apply 为准，避免仅残留 rebase-merge 目录时误判为 Rebase 进行中。 */
   async isRebasing(repoPath: string): Promise<boolean> {
+    try {
+      await this.git(repoPath, ['rev-parse', '-q', 'REBASE_HEAD']);
+      return true;
+    } catch { /* not in rebase-merge style rebase */ }
     const dir = await this.resolveGitDir(repoPath);
     if (!dir) { return false; }
-    return (await this.pathExists(path.join(dir, 'rebase-merge')))
-      || (await this.pathExists(path.join(dir, 'rebase-apply')));
+    return this.pathExists(path.join(dir, 'rebase-apply'));
   }
 
   async isMerging(repoPath: string): Promise<boolean> {
-    const dir = await this.resolveGitDir(repoPath);
-    if (!dir) { return false; }
-    return this.pathExists(path.join(dir, 'MERGE_HEAD'));
+    try {
+      await this.git(repoPath, ['rev-parse', '-q', 'MERGE_HEAD']);
+      return true;
+    } catch { return false; }
   }
 
   /**
