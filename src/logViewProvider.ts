@@ -1709,8 +1709,8 @@ function bindBI(el){
     }
     const tracking=el.dataset.tracking;
     const items=[];
-    items.push({icon:'\\u21AA',label:'Checkout',action:()=>vscode.postMessage({type:'checkoutBranch',branch:br})});
     items.push({icon:'\\u{1F4CB}',label:'Copy Branch Name',action:()=>{navigator.clipboard.writeText(br);}});
+    items.push({icon:'\\u21AA',label:'Checkout',action:()=>vscode.postMessage({type:'checkoutBranch',branch:br})});
     items.push({icon:'\\u2B07',label:'Update',action:()=>vscode.postMessage({type:'pullBranch',branch:br})});
     items.push({icon:'\\u{1F680}',label:'Push...',action:()=>vscode.postMessage({type:'pushBranch',branch:br,setUpstream:true})});
     items.push({icon:'\\u{1F33F}',label:'New Branch from \\''+br+'\\'...',action:()=>vscode.postMessage({type:'newBranchFrom',branch:br})});
