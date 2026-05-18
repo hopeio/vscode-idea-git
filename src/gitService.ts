@@ -801,7 +801,7 @@ export class GitService implements vscode.Disposable {
   }
 
   /** 未合并路径（含 submodule gitlink），比 diff-filter=U 更完整。 */
-  private async listUnmergedPaths(repoPath: string): Promise<string[]> {
+  async listUnmergedPaths(repoPath: string): Promise<string[]> {
     try {
       const out = await this.git(repoPath, ['ls-files', '-u']);
       const paths = new Set<string>();
@@ -930,6 +930,8 @@ export class GitService implements vscode.Disposable {
   }
 
   async getConflictFiles(repoPath: string): Promise<string[]> {
+    const unmerged = await this.listUnmergedPaths(repoPath);
+    if (unmerged.length) { return unmerged; }
     try {
       const out = await this.git(repoPath, ['diff', '--name-only', '--diff-filter=U']);
       return out.trim().split('\n').filter(Boolean);

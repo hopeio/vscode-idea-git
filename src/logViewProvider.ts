@@ -208,7 +208,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
         } catch (e: any) {
           vscode.window.showErrorMessage(`接受 ${side} 失败: ${e?.message || e}`);
         }
-        await this.refresh();
+        await this.refreshOpBanner();
         break;
       }
       case 'opRebaseContinue':
@@ -233,6 +233,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
           const detail = `${e?.stderr ?? ''}\n${e?.message ?? e}`.trim() || String(e);
           vscode.window.showWarningMessage(`${msg.type}: ${detail}`);
         }
+        await this.refreshOpBanner();
         await this.refresh();
         break;
       }
@@ -922,6 +923,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
     let firstRound = true;
     let lastAutoContinueFailed = false;
     while (await this.gitService.isRebasing(repo)) {
+      await this.refreshOpBanner();
       const conflicts = await this.gitService.getConflictFiles(repo);
       if (conflicts.length === 0 && !lastAutoContinueFailed) {
         try { await this.gitService.rebaseContinue(repo); continue; }
@@ -973,6 +975,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
     }
     let lastAutoCommitFailed = false;
     while (await this.gitService.isMerging(repo)) {
+      await this.refreshOpBanner();
       const conflicts = await this.gitService.getConflictFiles(repo);
       if (conflicts.length === 0 && !lastAutoCommitFailed) {
         try { await this.gitService.mergeContinue(repo); continue; }
@@ -996,6 +999,15 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       }
     }
     vscode.window.showInformationMessage('Merge 已完成');
+  }
+
+  /** 仅刷新顶栏 Merge/Rebase/冲突横幅，避免全量 log 刷新过慢或竞态导致计数不更新。 */
+  async refreshOpBanner(): Promise<void> {
+    if (!this.view || !this.currentRepo) { return; }
+    try {
+      const inProgress = await this.detectInProgress(this.currentRepo.rootPath);
+      this.postMessage({ type: 'opBanner', inProgress });
+    } catch { /* ignore */ }
   }
 
   async refresh() {
@@ -1051,7 +1063,7 @@ export class LogViewProvider implements vscode.WebviewViewProvider {
       this.gitService.isMerging(repo).catch(() => false),
     ]);
     let conflicts = 0;
-    try { conflicts = (await this.gitService.getConflictFiles(repo)).length; } catch { /* ignore */ }
+    try { conflicts = (await this.gitService.listUnmergedPaths(repo)).length; } catch { /* ignore */ }
     const conflictOnly = conflicts > 0 && !rebase && !merge;
     const base = { rebase, merge, conflicts, conflictOnly, repoName, head: '', onto: '', ontoName: '', otherRef: '', done: 0, total: 0 };
     if (rebase || merge) {
@@ -1392,6 +1404,8 @@ window.addEventListener('message',e=>{
     if(_sig!==lastBranchSig){lastBranchSig=_sig;renderBranches();}
     renderBranchFilter();renderAuthorList();renderFilterBar();renderLog(allCommits);
     if(filters.branch)highlightBranch(filters.branch);
+  }else if(m.type==='opBanner'){
+    renderOpBanner(m.inProgress||null);
   }else if(m.type==='commitFiles'){
     currentFilesHash=m.hash;currentFiles=m.files||[];currentDetail=m.detail||null;currentMergeGroups=m.mergeGroups||null;
     if(m.hash&&selectedHashes.size===1){selectedHashes.clear();selectedHashes.add(m.hash);renderLog(allCommits);}

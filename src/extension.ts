@@ -200,6 +200,14 @@ export async function activate(context: vscode.ExtensionContext) {
   headWatcher.onDidChange(() => { statusBar.refresh(); logProvider.refresh(); });
   context.subscriptions.push(headWatcher);
 
+  let indexBannerTimer: ReturnType<typeof setTimeout> | undefined;
+  const indexWatcher = vscode.workspace.createFileSystemWatcher('**/.git/index');
+  indexWatcher.onDidChange(() => {
+    if (indexBannerTimer) { clearTimeout(indexBannerTimer); }
+    indexBannerTimer = setTimeout(() => { void logProvider.refreshOpBanner(); }, 250);
+  });
+  context.subscriptions.push(indexWatcher);
+
   const gitDirWatcher = vscode.workspace.createFileSystemWatcher('**/.git', false, true, true);
   gitDirWatcher.onDidCreate(() => { rescanRepos(); });
   context.subscriptions.push(gitDirWatcher);
@@ -279,12 +287,15 @@ async function setupBuiltinGitWatcher(
   const lastHead = new Map<string, string>();
   const onRepoChange = (repo: any) => {
     const head = repo.state?.HEAD;
-    const sig = `${head?.name || ''}@${head?.commit || ''}`;
+    const mergeN = repo.state?.mergeChanges?.length ?? 0;
+    const rebase = repo.state?.rebasing ? 1 : 0;
+    const sig = `${head?.name || ''}@${head?.commit || ''}|m${mergeN}|r${rebase}`;
     const key = repo.rootUri?.fsPath || '';
     if (lastHead.get(key) === sig) { return; }
     lastHead.set(key, sig);
     statusBar.refresh();
-    logProvider.refresh();
+    if (mergeN > 0 || rebase) { void logProvider.refreshOpBanner(); }
+    else { logProvider.refresh(); }
   };
   const subscribe = (repo: any) => {
     if (!repo || seen.has(repo)) { return; }
