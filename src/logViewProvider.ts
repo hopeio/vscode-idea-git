@@ -1441,6 +1441,13 @@ function toggleRepoSelectDropdown(){
   dd.style.maxWidth='min(360px,60vw)';
   dd.classList.add('show');
 }
+(function(){
+  const dd=$('repoSelectDD');
+  if(dd&&!dd.dataset.wheelBound){
+    dd.dataset.wheelBound='1';
+    dd.addEventListener('wheel',ev=>ev.stopPropagation(),{passive:true});
+  }
+})();
 function renderRepoSelect(repos,cur){
   const wrap=$('repoSelectWrap');
   const btn=$('repoSelectBtn');
@@ -2116,9 +2123,13 @@ function onGlobalPointerDown(ev){
 window.addEventListener('mousedown',onGlobalPointerDown,true);
 window.addEventListener('blur',()=>{hideMenus();});
 document.addEventListener('scroll',ev=>{
-  if(ev.target===$('ctxMenu')||$('ctxMenu').contains(ev.target))return;
-  if(ev.target===$('ctxSubMenu')||$('ctxSubMenu').contains(ev.target))return;
-  if(ev.target===$('datePicker')||$('datePicker').contains(ev.target))return;
+  const t=ev.target;
+  const cm=$('ctxMenu'),sub=$('ctxSubMenu'),dp=$('datePicker'),repoDD=$('repoSelectDD'),branchDD=$('branchDD');
+  if(cm&&(t===cm||cm.contains(t)))return;
+  if(sub&&(t===sub||sub.contains(t)))return;
+  if(dp&&(t===dp||dp.contains(t)))return;
+  if(repoDD&&(t===repoDD||repoDD.contains(t)))return;
+  if(branchDD&&(t===branchDD||branchDD.contains(t)))return;
   hideMenus();
   closeRepoSelectDropdown();
 },true);
